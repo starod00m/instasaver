@@ -83,6 +83,8 @@ async def download_instagram_video(url: str) -> Optional[Path]:
             "--no-warnings",
             "--format",
             "best",
+            "--limit-rate",
+            "1M",
             "--output",
             output_template,
             url,
