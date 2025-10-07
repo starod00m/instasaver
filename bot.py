@@ -81,6 +81,46 @@ def ensure_temp_directory() -> None:
     logger.info(f"Temp directory: {TEMP_DIR.absolute()}")
 
 
+async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
+    """Extract video dimensions using ffprobe.
+
+    :param video_path: Path to video file
+    :type video_path: Path
+    :return: Tuple of (width, height)
+    :rtype: tuple[int, int]
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0",
+            str(video_path)
+        ]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, stderr = await process.communicate()
+
+        if process.returncode == 0:
+            output = stdout.decode().strip()
+            width, height = map(int, output.split('x'))
+            logger.info(f"Video dimensions: {width}x{height}")
+            return width, height
+        else:
+            logger.warning("Could not extract video dimensions")
+            return 0, 0
+
+    except Exception as e:
+        logger.error(f"Error extracting video dimensions: {e}")
+        return 0, 0
+
+
 async def download_video(url: str, use_proxy: bool = False) -> Optional[Path]:
     """Download video from Instagram or TikTok using yt-dlp.
 
@@ -254,9 +294,16 @@ async def handle_message(message: Message) -> None:
             )
             return
 
-        # Send video as reply to original message
+        # Get video dimensions
+        width, height = await get_video_dimensions(video_path)
+
+        # Send video as reply to original message with correct dimensions
         video_file = FSInputFile(video_path)
-        await message.reply_video(video_file)
+        await message.reply_video(
+            video_file,
+            width=width if width > 0 else None,
+            height=height if height > 0 else None,
+        )
 
         # Delete status message
         await status_message.delete()
