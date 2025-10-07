@@ -1,6 +1,6 @@
-"""Instagram Reels downloader bot for Telegram.
+"""Instagram Reels and TikTok downloader bot for Telegram.
 
-This bot monitors messages in groups and channels, detects Instagram Reels URLs,
+This bot monitors messages in groups and channels, detects Instagram Reels and TikTok URLs,
 downloads videos using yt-dlp, and replies with the downloaded content.
 """
 
@@ -32,11 +32,28 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+PROXY_URL = os.getenv("PROXY_URL")
 TEMP_DIR = Path("temp")
 
-# Regex pattern for Instagram Reels URLs
+# Log environment variables status
+if TELEGRAM_BOT_TOKEN:
+    logger.info("TELEGRAM_BOT_TOKEN loaded from environment")
+else:
+    logger.warning("TELEGRAM_BOT_TOKEN not found in environment")
+
+if PROXY_URL:
+    logger.info("PROXY_URL loaded from environment")
+else:
+    logger.info("PROXY_URL not set (optional)")
+
+# Regex patterns for supported platforms
 INSTAGRAM_REELS_PATTERN = re.compile(
     r"https?://(?:www\.)?instagram\.com/(reel|p|tv)/[\w-]+/?",
+    re.IGNORECASE,
+)
+
+TIKTOK_PATTERN = re.compile(
+    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[@\w\-/.?=&]+",
     re.IGNORECASE,
 )
 
@@ -64,11 +81,13 @@ def ensure_temp_directory() -> None:
     logger.info(f"Temp directory: {TEMP_DIR.absolute()}")
 
 
-async def download_instagram_video(url: str) -> Optional[Path]:
-    """Download Instagram video using yt-dlp.
+async def download_video(url: str, use_proxy: bool = False) -> Optional[Path]:
+    """Download video from Instagram or TikTok using yt-dlp.
 
-    :param url: Instagram Reels/post URL
+    :param url: Instagram Reels/post or TikTok URL
     :type url: str
+    :param use_proxy: Whether to use proxy for download (required for TikTok)
+    :type use_proxy: bool
     :return: Path to downloaded video file or None if download failed
     :rtype: Optional[Path]
     """
@@ -76,18 +95,31 @@ async def download_instagram_video(url: str) -> Optional[Path]:
         # Generate unique filename
         output_template = str(TEMP_DIR / "%(id)s.%(ext)s")
 
-        # Run yt-dlp to download video
-        process = await asyncio.create_subprocess_exec(
+        # Build yt-dlp command
+        cmd = [
             "yt-dlp",
             "--quiet",
             "--no-warnings",
             "--format",
             "best",
             "--limit-rate",
-            "4M",
+            "8M",
             "--output",
             output_template,
-            url,
+        ]
+
+        # Add proxy if needed and available
+        if use_proxy and PROXY_URL:
+            cmd.extend(["--proxy", PROXY_URL])
+            logger.info("Using proxy for download")
+        elif use_proxy and not PROXY_URL:
+            logger.warning("Proxy requested but PROXY_URL not set in environment")
+
+        cmd.append(url)
+
+        # Run yt-dlp to download video
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -138,9 +170,9 @@ async def cmd_start(message: Message) -> None:
     :return: None
     """
     await message.answer(
-        "👋 Привет! Я бот для скачивания Instagram Reels.\n\n"
+        "👋 Привет! Я бот для скачивания видео из Instagram и TikTok.\n\n"
         "Добавь меня в группу или канал, и я буду автоматически "
-        "скачивать и отправлять видео из Instagram Reels.\n\n"
+        "скачивать и отправлять видео из Instagram Reels и TikTok.\n\n"
         "Используй /help для получения дополнительной информации."
     )
 
@@ -156,12 +188,15 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "ℹ️ <b>Как использовать бота:</b>\n\n"
         "1. Добавьте меня в группу или канал\n"
-        "2. Отправьте ссылку на Instagram Reels\n"
+        "2. Отправьте ссылку на Instagram Reels или TikTok\n"
         "3. Бот скачает видео и отправит его в ответ\n\n"
         "<b>Поддерживаемые ссылки:</b>\n"
         "• instagram.com/reel/...\n"
         "• instagram.com/p/...\n"
-        "• instagram.com/tv/...\n\n"
+        "• instagram.com/tv/...\n"
+        "• tiktok.com/@username/video/...\n"
+        "• vm.tiktok.com/...\n"
+        "• vt.tiktok.com/...\n\n"
         "<b>Примечание:</b> Работает только с публичным контентом.",
         parse_mode="HTML",
     )
@@ -169,7 +204,7 @@ async def cmd_help(message: Message) -> None:
 
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
-    """Handle incoming messages and process Instagram URLs.
+    """Handle incoming messages and process Instagram and TikTok URLs.
 
     :param message: Incoming message
     :type message: Message
@@ -178,25 +213,39 @@ async def handle_message(message: Message) -> None:
     if not message.text:
         return
 
-    # Search for Instagram Reels URLs
-    matches = INSTAGRAM_REELS_PATTERN.findall(message.text)
-    if not matches:
+    # Check for Instagram URLs
+    instagram_match = INSTAGRAM_REELS_PATTERN.search(message.text)
+    # Check for TikTok URLs
+    tiktok_match = TIKTOK_PATTERN.search(message.text)
+
+    if not instagram_match and not tiktok_match:
         return
 
-    # Extract the full URL
-    url_match = INSTAGRAM_REELS_PATTERN.search(message.text)
-    if not url_match:
+    # Determine which URL was found
+    video_url = None
+    platform = None
+    use_proxy = False
+
+    if instagram_match:
+        video_url = instagram_match.group(0)
+        platform = "Instagram"
+        use_proxy = False
+    elif tiktok_match:
+        video_url = tiktok_match.group(0)
+        platform = "TikTok"
+        use_proxy = True  # TikTok requires proxy
+
+    if not video_url:
         return
 
-    instagram_url = url_match.group(0)
-    logger.info(f"Detected Instagram URL: {instagram_url}")
+    logger.info(f"Detected {platform} URL: {video_url}")
 
     # Send status message
     status_message = await message.reply("⏳ Скачиваю видео...")
 
     try:
         # Download video
-        video_path = await download_instagram_video(instagram_url)
+        video_path = await download_video(video_url, use_proxy=use_proxy)
 
         if not video_path:
             await status_message.edit_text(
