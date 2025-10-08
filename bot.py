@@ -121,15 +121,15 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
         return 0, 0
 
 
-async def download_video(url: str, use_proxy: bool = False) -> Optional[Path]:
+async def download_video(url: str, use_proxy: bool = False) -> tuple[Optional[Path], Optional[str]]:
     """Download video from Instagram or TikTok using yt-dlp.
 
     :param url: Instagram Reels/post or TikTok URL
     :type url: str
     :param use_proxy: Whether to use proxy for download (required for TikTok)
     :type use_proxy: bool
-    :return: Path to downloaded video file or None if download failed
-    :rtype: Optional[Path]
+    :return: Tuple of (Path to downloaded video file or None if download failed, error message or None)
+    :rtype: tuple[Optional[Path], Optional[str]]
     """
     try:
         # Generate unique filename
@@ -169,22 +169,24 @@ async def download_video(url: str, use_proxy: bool = False) -> Optional[Path]:
         if process.returncode != 0:
             error_msg = stderr.decode().strip()
             logger.error(f"yt-dlp error: {error_msg}")
-            return None
+            return None, error_msg
 
         # Find the downloaded file
         files = list(TEMP_DIR.glob("*"))
         if not files:
-            logger.error("No file was downloaded")
-            return None
+            error_msg = "No file was downloaded"
+            logger.error(error_msg)
+            return None, error_msg
 
         # Get the most recent file
         video_file = max(files, key=lambda p: p.stat().st_mtime)
         logger.info(f"Downloaded: {video_file.name}")
-        return video_file
+        return video_file, None
 
     except Exception as e:
-        logger.error(f"Download error: {e}")
-        return None
+        error_msg = str(e)
+        logger.error(f"Download error: {error_msg}")
+        return None, error_msg
 
 
 async def cleanup_file(file_path: Path) -> None:
@@ -285,13 +287,15 @@ async def handle_message(message: Message) -> None:
 
     try:
         # Download video
-        video_path = await download_video(video_url, use_proxy=use_proxy)
+        video_path, error_msg = await download_video(video_url, use_proxy=use_proxy)
 
         if not video_path:
-            await status_message.edit_text(
-                "❌ Не удалось скачать видео. Возможно, контент недоступен "
-                "или является приватным."
-            )
+            error_text = "❌ Не удалось скачать видео."
+            if error_msg:
+                error_text += f"\n\nОшибка yt-dlp:\n{error_msg}"
+            else:
+                error_text += " Возможно, контент недоступен или является приватным."
+            await status_message.edit_text(error_text)
             return
 
         # Get video dimensions
