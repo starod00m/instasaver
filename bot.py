@@ -1,7 +1,7 @@
 """Instagram Reels and TikTok downloader bot for Telegram.
 
-This bot monitors messages in groups and channels, detects Instagram Reels and TikTok URLs,
-downloads videos using yt-dlp, and replies with the downloaded content.
+This bot monitors messages in private chats, groups, and channels, detects Instagram Reels
+and TikTok URLs, downloads videos using yt-dlp, and replies with the downloaded content.
 """
 
 import asyncio
@@ -213,8 +213,10 @@ async def cmd_start(message: Message) -> None:
     """
     await message.answer(
         "👋 Привет! Я бот для скачивания видео из Instagram и TikTok.\n\n"
-        "Добавь меня в группу или канал, и я буду автоматически "
-        "скачивать и отправлять видео из Instagram Reels и TikTok.\n\n"
+        "Просто отправь мне ссылку на Instagram Reels или TikTok видео, "
+        "и я скачаю его для тебя.\n\n"
+        "Также можешь добавить меня в группу или канал - "
+        "я буду автоматически скачивать все видео из отправленных ссылок.\n\n"
         "Используй /help для получения дополнительной информации."
     )
 
@@ -229,9 +231,14 @@ async def cmd_help(message: Message) -> None:
     """
     await message.answer(
         "ℹ️ <b>Как использовать бота:</b>\n\n"
+        "<b>Вариант 1: Личный чат</b>\n"
+        "Просто отправьте мне ссылку на Instagram Reels или TikTok видео, "
+        "и я скачаю его для вас.\n\n"
+        "<b>Вариант 2: Группа или канал</b>\n"
         "1. Добавьте меня в группу или канал\n"
-        "2. Отправьте ссылку на Instagram Reels или TikTok\n"
-        "3. Бот скачает видео и отправит его в ответ\n\n"
+        "2. Убедитесь, что Privacy Mode отключен (см. @BotFather)\n"
+        "3. Отправьте ссылку на видео\n"
+        "4. Бот скачает видео и отправит его в ответ\n\n"
         "<b>Поддерживаемые ссылки:</b>\n"
         "• instagram.com/reel/...\n"
         "• instagram.com/p/...\n"
