@@ -8,4 +8,6 @@ dependencies = [
     "aiogram>=3.22.0",
     "python-dotenv>=1.1.1",
     "yt-dlp>=2025.9.26",
+    "gspread>=6.1.4",
+    "google-auth>=2.36.0",
 ]
