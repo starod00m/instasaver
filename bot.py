@@ -19,6 +19,8 @@ from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 from dotenv import load_dotenv
 
+from stats import GoogleSheetsStats
+
 # Load environment variables
 load_dotenv()
 
@@ -33,7 +35,11 @@ logger = logging.getLogger(__name__)
 # Bot configuration
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 TEMP_DIR = Path("temp")
+
+# Initialize stats tracker
+stats = GoogleSheetsStats()
 
 # Log environment variables status
 if TELEGRAM_BOT_TOKEN:
@@ -251,6 +257,59 @@ async def cmd_help(message: Message) -> None:
     )
 
 
+@router.message(Command("stats"))
+async def cmd_stats(message: Message) -> None:
+    """Handle /stats command (admin only).
+
+    Показывает статистику использования бота за последние 30 дней.
+    Доступна только администратору, указанному в ADMIN_USER_ID.
+
+    :param message: Incoming message
+    :type message: Message
+    :return: None
+    """
+    # Проверяем, что команду отправил админ
+    if not ADMIN_USER_ID or str(message.from_user.id) != ADMIN_USER_ID:
+        logger.debug(
+            f"Stats request from non-admin user {message.from_user.id}, ignoring. "
+            f"Admin ID: {ADMIN_USER_ID}"
+        )
+        return
+
+    logger.info(f"Stats request from admin user {message.from_user.id}")
+
+    # Отправляем сообщение о загрузке
+    status_msg = await message.answer("📊 Получаю статистику...")
+
+    try:
+        # Получаем статистику за последние 30 дней
+        logger.debug("Requesting stats for 30 days")
+        stats_data = await stats.get_stats(days=30)
+
+        if stats_data:
+            logger.info(
+                f"Stats retrieved successfully: {stats_data['total']} total records, "
+                f"{stats_data['success']} successful"
+            )
+            # Форматируем и отправляем статистику
+            formatted_message = stats.format_stats_message(stats_data)
+            await status_msg.edit_text(formatted_message, parse_mode="HTML")
+            logger.info(f"Stats sent to admin {message.from_user.id}")
+        else:
+            logger.warning("Stats data is None, Google Sheets may not be configured")
+            await status_msg.edit_text(
+                "❌ Не удалось получить статистику.\n"
+                "Проверьте настройки Google Sheets API."
+            )
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        logger.debug(f"Exception type: {type(e).__name__}")
+        await status_msg.edit_text(
+            "❌ Произошла ошибка при получении статистики."
+        )
+
+
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     """Handle incoming messages and process Instagram and TikTok URLs.
@@ -303,6 +362,15 @@ async def handle_message(message: Message) -> None:
             else:
                 error_text += " Возможно, контент недоступен или является приватным."
             await status_message.edit_text(error_text)
+
+            # Логируем ошибку в статистику (не блокирует основной функционал)
+            asyncio.create_task(stats.log_download_error(
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                platform=platform,
+                url=video_url,
+                error_msg=error_msg or "Unknown error"
+            ))
             return
 
         # Get video dimensions
@@ -318,6 +386,14 @@ async def handle_message(message: Message) -> None:
 
         # Delete status message
         await status_message.delete()
+
+        # Логируем успешное скачивание в статистику (не блокирует основной функционал)
+        asyncio.create_task(stats.log_download_success(
+            user_id=message.from_user.id,
+            chat_id=message.chat.id,
+            platform=platform,
+            url=video_url
+        ))
 
         # Cleanup temporary file
         await cleanup_file(video_path)
