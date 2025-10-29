@@ -26,6 +26,7 @@ RUN uv sync --frozen --no-dev
 
 # Copy application code
 COPY bot.py ./
+COPY stats.py ./
 
 # Create non-root user and set up permissions
 RUN useradd -m -u 1000 -s /bin/bash botuser && \
