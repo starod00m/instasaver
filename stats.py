@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -32,7 +33,8 @@ class GoogleSheetsStats:
         """
         Инициализация клиента Google Sheets.
 
-        Использует credentials из переменной окружения GOOGLE_CREDENTIALS_JSON.
+        Использует credentials из переменной окружения GOOGLE_CREDENTIALS_JSON_BASE64.
+        Credentials должны быть в формате Base64-кодированного JSON.
         При ошибках инициализации логирует предупреждение, но не падает.
         """
         self.client: Optional[gspread.Client] = None
@@ -41,23 +43,24 @@ class GoogleSheetsStats:
         self._initialized = False
 
         try:
-            credentials_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+            credentials_json_b64 = os.getenv("GOOGLE_CREDENTIALS_JSON_BASE64")
             spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")
 
-            if not credentials_json or not spreadsheet_id:
+            if not credentials_json_b64 or not spreadsheet_id:
                 logger.warning(
                     "Google Sheets credentials not configured. "
                     "Stats collection will be disabled."
                 )
                 logger.info(
-                    f"GOOGLE_CREDENTIALS_JSON present: {bool(credentials_json)}, "
+                    f"GOOGLE_CREDENTIALS_JSON_BASE64 present: {bool(credentials_json_b64)}, "
                     f"GOOGLE_SHEETS_SPREADSHEET_ID present: {bool(spreadsheet_id)}"
                 )
                 return
 
             logger.info("Initializing Google Sheets stats...")
 
-            # Парсинг credentials из JSON строки
+            # Декодирование credentials из Base64 и парсинг JSON
+            credentials_json = base64.b64decode(credentials_json_b64).decode('utf-8')
             credentials_dict = json.loads(credentials_json)
             logger.debug(f"Parsed credentials for project: {credentials_dict.get('project_id', 'unknown')}")
 
@@ -83,7 +86,7 @@ class GoogleSheetsStats:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse Google credentials JSON: {e}")
-            logger.debug("Ensure GOOGLE_CREDENTIALS_JSON is valid JSON without newlines")
+            logger.debug("Ensure GOOGLE_CREDENTIALS_JSON_BASE64 is valid Base64-encoded JSON")
         except gspread.exceptions.SpreadsheetNotFound:
             logger.error(
                 f"Spreadsheet not found with ID: {spreadsheet_id}. "
