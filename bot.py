@@ -8,7 +8,6 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -98,11 +97,15 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
     try:
         cmd = [
             "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=s=x:p=0",
-            str(video_path)
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            str(video_path),
         ]
 
         process = await asyncio.create_subprocess_exec(
@@ -115,7 +118,7 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
 
         if process.returncode == 0:
             output = stdout.decode().strip()
-            width, height = map(int, output.split('x'))
+            width, height = map(int, output.split("x"))
             logger.info(f"Video dimensions: {width}x{height}")
             return width, height
         else:
@@ -127,7 +130,9 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
         return 0, 0
 
 
-async def download_video(url: str, use_proxy: bool = False) -> tuple[Optional[Path], Optional[str]]:
+async def download_video(
+    url: str, use_proxy: bool = False
+) -> tuple[Optional[Path], Optional[str]]:
     """Download video from Instagram or TikTok using yt-dlp.
 
     :param url: Instagram Reels/post or TikTok URL
@@ -305,9 +310,7 @@ async def cmd_stats(message: Message) -> None:
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         logger.debug(f"Exception type: {type(e).__name__}")
-        await status_msg.edit_text(
-            "❌ Произошла ошибка при получении статистики."
-        )
+        await status_msg.edit_text("❌ Произошла ошибка при получении статистики.")
 
 
 @router.message(F.text)
@@ -364,13 +367,15 @@ async def handle_message(message: Message) -> None:
             await status_message.edit_text(error_text)
 
             # Логируем ошибку в статистику (не блокирует основной функционал)
-            asyncio.create_task(stats.log_download_error(
-                user_id=message.from_user.id,
-                chat_id=message.chat.id,
-                platform=platform,
-                url=video_url,
-                error_msg=error_msg or "Unknown error"
-            ))
+            asyncio.create_task(
+                stats.log_download_error(
+                    user_id=message.from_user.id,
+                    chat_id=message.chat.id,
+                    platform=platform,
+                    url=video_url,
+                    error_msg=error_msg or "Unknown error",
+                )
+            )
             return
 
         # Get video dimensions
@@ -388,21 +393,21 @@ async def handle_message(message: Message) -> None:
         await status_message.delete()
 
         # Логируем успешное скачивание в статистику (не блокирует основной функционал)
-        asyncio.create_task(stats.log_download_success(
-            user_id=message.from_user.id,
-            chat_id=message.chat.id,
-            platform=platform,
-            url=video_url
-        ))
+        asyncio.create_task(
+            stats.log_download_success(
+                user_id=message.from_user.id,
+                chat_id=message.chat.id,
+                platform=platform,
+                url=video_url,
+            )
+        )
 
         # Cleanup temporary file
         await cleanup_file(video_path)
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
-        await status_message.edit_text(
-            "❌ Произошла ошибка при обработке запроса."
-        )
+        await status_message.edit_text("❌ Произошла ошибка при обработке запроса.")
 
 
 async def main() -> None:
