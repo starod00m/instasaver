@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -131,73 +132,132 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
 
 
 async def download_video(
-    url: str, use_proxy: bool = False
+    url: str, use_proxy: bool = False, max_retries: int = 3
 ) -> tuple[Optional[Path], Optional[str]]:
-    """Download video from Instagram or TikTok using yt-dlp.
+    """Download video from Instagram or TikTok using yt-dlp with retry support.
 
     :param url: Instagram Reels/post or TikTok URL
     :type url: str
     :param use_proxy: Whether to use proxy for download (required for TikTok)
     :type use_proxy: bool
+    :param max_retries: Maximum number of retry attempts
+    :type max_retries: int
     :return: Tuple of (Path to downloaded video file or None if download failed, error message or None)
     :rtype: tuple[Optional[Path], Optional[str]]
     """
-    try:
-        # Generate unique filename
-        output_template = str(TEMP_DIR / "%(id)s.%(ext)s")
+    # Rate limits to try in order (yt-dlp format: 8M = 8 MiB/s)
+    # Start with 8M, then try lower rates if rate-limit errors occur
+    rate_limits = ["8M", "4M", "2M", "1M"]
 
-        # Build yt-dlp command
-        cmd = [
-            "yt-dlp",
-            "--quiet",
-            "--no-warnings",
-            "--format",
-            "best",
-            "--limit-rate",
-            "8M",
-            "--output",
-            output_template,
-        ]
+    last_error_msg: Optional[str] = None
+    current_rate_limit_index = 0
 
-        # Add proxy if needed and available
-        if use_proxy and PROXY_URL:
-            cmd.extend(["--proxy", PROXY_URL])
-            logger.info("Using proxy for download")
-        elif use_proxy and not PROXY_URL:
-            logger.warning("Proxy requested but PROXY_URL not set in environment")
+    # Generate unique download identifier to avoid file collisions
+    download_id = str(uuid.uuid4())[:8]
 
-        cmd.append(url)
+    for attempt in range(max_retries):
+        try:
+            # Determine rate limit based on rate-limit errors
+            current_rate_limit = rate_limits[min(current_rate_limit_index, len(rate_limits) - 1)]
 
-        # Run yt-dlp to download video
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+            if attempt > 0:
+                logger.info(
+                    f"Retry attempt {attempt + 1}/{max_retries} with rate-limit: {current_rate_limit}"
+                )
+                # Add fixed delay before retry
+                await asyncio.sleep(2)
 
-        stdout, stderr = await process.communicate()
+            # Generate unique filename with download_id prefix
+            output_template = str(TEMP_DIR / f"{download_id}_%(id)s.%(ext)s")
 
-        if process.returncode != 0:
-            error_msg = stderr.decode().strip()
-            logger.error(f"yt-dlp error: {error_msg}")
-            return None, error_msg
+            # Build yt-dlp command
+            cmd = [
+                "yt-dlp",
+                "--quiet",
+                "--no-warnings",
+                "--format",
+                "best",
+                "--limit-rate",
+                current_rate_limit,
+                "--output",
+                output_template,
+            ]
 
-        # Find the downloaded file
-        files = list(TEMP_DIR.glob("*"))
-        if not files:
-            error_msg = "No file was downloaded"
-            logger.error(error_msg)
-            return None, error_msg
+            # Add proxy if needed and available
+            if use_proxy and PROXY_URL:
+                cmd.extend(["--proxy", PROXY_URL])
+                if attempt == 0:
+                    logger.info("Using proxy for download")
+            elif use_proxy and not PROXY_URL:
+                logger.warning("Proxy requested but PROXY_URL not set in environment")
 
-        # Get the most recent file
-        video_file = max(files, key=lambda p: p.stat().st_mtime)
-        logger.info(f"Downloaded: {video_file.name}")
-        return video_file, None
+            cmd.append(url)
 
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Download error: {error_msg}")
-        return None, error_msg
+            # Run yt-dlp to download video
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                error_msg = stderr.decode().strip()
+                last_error_msg = error_msg
+
+                # Check if it's a rate-limit error
+                error_msg_lower = error_msg.lower()
+                is_rate_limit_error = (
+                    "429" in error_msg
+                    or "rate limit" in error_msg_lower
+                    or "rate-limit" in error_msg_lower
+                    or "too many requests" in error_msg_lower
+                )
+
+                if is_rate_limit_error:
+                    logger.warning(
+                        f"Rate-limit error detected (attempt {attempt + 1}/{max_retries}): {error_msg}"
+                    )
+                    # Reduce rate limit for next attempt
+                    current_rate_limit_index += 1
+                    # Continue to retry with lower rate limit
+                    if attempt < max_retries - 1:
+                        continue
+                else:
+                    logger.error(f"yt-dlp error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                    # For non-rate-limit errors, retry might still help
+                    if attempt < max_retries - 1:
+                        continue
+
+                # Last attempt failed
+                return None, error_msg
+
+            # Find the downloaded file with download_id prefix
+            files = list(TEMP_DIR.glob(f"{download_id}_*"))
+            if not files:
+                error_msg = "No file was downloaded"
+                last_error_msg = error_msg
+                if attempt < max_retries - 1:
+                    logger.warning(f"{error_msg} (attempt {attempt + 1}/{max_retries})")
+                    continue
+                logger.error(f"{error_msg} - all retries exhausted")
+                return None, error_msg
+
+            # Get the most recent file (should be only one with our download_id)
+            video_file = max(files, key=lambda p: p.stat().st_mtime)
+            logger.info(f"Downloaded: {video_file.name} (attempt {attempt + 1})")
+            return video_file, None
+
+        except Exception as e:
+            error_msg = str(e)
+            last_error_msg = error_msg
+            logger.error(f"Download error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+            if attempt < max_retries - 1:
+                continue
+
+    # If we've exhausted all retries
+    return None, last_error_msg or "Download failed after all retry attempts"
 
 
 async def cleanup_file(file_path: Path) -> None:
@@ -346,7 +406,7 @@ async def handle_message(message: Message) -> None:
         platform = "TikTok"
         use_proxy = True  # TikTok requires proxy
 
-    if not video_url:
+    if video_url is None:
         return
 
     logger.info(f"Detected {platform} URL: {video_url}")
@@ -358,12 +418,46 @@ async def handle_message(message: Message) -> None:
         # Download video
         video_path, error_msg = await download_video(video_url, use_proxy=use_proxy)
 
-        if not video_path:
+        if video_path is None:
+            # Логируем исходную ошибку от yt-dlp
+            logger.error(f"Failed to download video from {platform}. URL: {video_url}. Error: {error_msg}")
+
+            # Формируем понятное сообщение об ошибке на русском
             error_text = "❌ Не удалось скачать видео."
+
             if error_msg:
-                error_text += f"\n\nОшибка yt-dlp:\n{error_msg}"
+                error_msg_lower = error_msg.lower()
+
+                # Проверяем специфичные ошибки и выводим понятные сообщения
+                if "this content may be inappropriate" in error_msg_lower or "inappropriate" in error_msg_lower:
+                    error_text += "\n\n💬 Видео может содержать контент для взрослых или материалы, которые требуют входа в аккаунт для просмотра."
+                    logger.info(f"Inappropriate content error for URL: {video_url}")
+                elif "private" in error_msg_lower or "приватн" in error_msg_lower:
+                    error_text += "\n\n🔒 Видео является приватным и недоступно для скачивания."
+                    logger.info(f"Private content error for URL: {video_url}")
+                elif "not available" in error_msg_lower or "unavailable" in error_msg_lower:
+                    error_text += "\n\n🚫 Видео недоступно. Возможно, оно было удалено или скрыто автором."
+                    logger.info(f"Content not available for URL: {video_url}")
+                elif "age" in error_msg_lower and "restrict" in error_msg_lower:
+                    error_text += "\n\n🔞 Видео имеет возрастные ограничения и требует входа в аккаунт."
+                    logger.info(f"Age-restricted content for URL: {video_url}")
+                elif "login" in error_msg_lower or "sign in" in error_msg_lower:
+                    error_text += "\n\n🔑 Для скачивания этого видео требуется авторизация в аккаунте."
+                    logger.info(f"Login required for URL: {video_url}")
+                elif "geo" in error_msg_lower or "region" in error_msg_lower or "country" in error_msg_lower:
+                    error_text += "\n\n🌍 Видео недоступно в вашем регионе из-за географических ограничений."
+                    logger.info(f"Geo-restricted content for URL: {video_url}")
+                elif "429" in error_msg or "rate limit" in error_msg_lower or "too many requests" in error_msg_lower:
+                    error_text += "\n\n⏱️ Слишком много запросов. Пожалуйста, попробуйте позже."
+                    logger.info(f"Rate limit error for URL: {video_url}")
+                else:
+                    # Для неизвестных ошибок показываем оригинальное сообщение
+                    error_text += f"\n\n⚠️ Техническая информация:\n{error_msg}"
+                    logger.warning(f"Unknown error type for URL: {video_url}")
             else:
-                error_text += " Возможно, контент недоступен или является приватным."
+                error_text += "\n\n❓ Возможно, контент недоступен или является приватным."
+                logger.warning(f"No error message provided for failed download: {video_url}")
+
             await status_message.edit_text(error_text)
 
             # Логируем ошибку в статистику (не блокирует основной функционал)
