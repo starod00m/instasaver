@@ -239,7 +239,7 @@ async def download_video(
                 return None, error_msg, None
 
             # Find the downloaded file with download_id prefix
-            files = list(TEMP_DIR.glob(f"{download_id}_*"))
+            files = [p for p in TEMP_DIR.glob(f"{download_id}_*") if p.suffix != ".json"]
             if not files:
                 error_msg = "No file was downloaded"
                 last_error_msg = error_msg
@@ -291,7 +291,7 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
     :rtype: Optional[str]
     """
     try:
-        info_path = video_path.with_suffix(".info.json")
+        info_path = video_path.parent / (video_path.name + ".info.json")
         if not info_path.exists():
             logger.debug(f"Info JSON not found: {info_path.name}")
             return None
@@ -302,7 +302,7 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
         data = json.loads(content)
         description = data.get("description")
 
-        if description is None or not description.strip():
+        if description is None or not isinstance(description, str) or not description.strip():
             return None
 
         # Telegram caption limit is 1024 characters
@@ -320,11 +320,11 @@ async def cleanup_info_json(video_path: Path) -> None:
     :type video_path: Path
     :return: None
     """
-    info_path = video_path.with_suffix(".info.json")
+    info_path = video_path.parent / (video_path.name + ".info.json")
     try:
         if await aiofiles.os.path.exists(info_path):
             await aiofiles.os.remove(info_path)
-            logger.info(f"Cleaned up info JSON: {info_path.name}")
+            logger.debug(f"Cleaned up info JSON: {info_path.name}")
     except Exception as e:
         logger.warning(f"Could not clean up info JSON {info_path.name}: {e}")
 
