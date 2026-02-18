@@ -292,7 +292,7 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
     """
     try:
         info_path = video_path.parent / (video_path.name + ".info.json")
-        if not info_path.exists():
+        if not await aiofiles.os.path.exists(info_path):
             logger.debug(f"Info JSON not found: {info_path.name}")
             return None
 
@@ -305,8 +305,8 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
         if description is None or not isinstance(description, str) or not description.strip():
             return None
 
-        # Telegram caption limit is 1024 characters
-        return description.strip()[:1024]
+        # Telegram caption limit is 4096 characters
+        return description.strip()[:4096]
 
     except Exception as e:
         logger.warning(f"Could not extract video description: {e}")
