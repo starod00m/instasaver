@@ -137,7 +137,7 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
 
 async def download_video(
     url: str, use_proxy: bool = False, max_retries: int = 3
-) -> tuple[Optional[Path], Optional[str], Optional[str]]:
+) -> tuple[Optional[Path], Optional[str]]:
     """Download video from Instagram or TikTok using yt-dlp with retry support.
 
     :param url: Instagram Reels/post or TikTok URL
@@ -146,8 +146,8 @@ async def download_video(
     :type use_proxy: bool
     :param max_retries: Maximum number of retry attempts
     :type max_retries: int
-    :return: Tuple of (Path to downloaded video file or None, error message or None, description or None)
-    :rtype: tuple[Optional[Path], Optional[str], Optional[str]]
+    :return: Tuple of (Path to downloaded video file or None if download failed, error message or None)
+    :rtype: tuple[Optional[Path], Optional[str]]
     """
     # Rate limits to try in order (yt-dlp format: 8M = 8 MiB/s)
     # Start with 8M, then try lower rates if rate-limit errors occur
@@ -236,7 +236,7 @@ async def download_video(
                         continue
 
                 # Last attempt failed
-                return None, error_msg, None
+                return None, error_msg
 
             # Find the downloaded file with download_id prefix
             files = [p for p in TEMP_DIR.glob(f"{download_id}_*") if p.suffix != ".json"]
@@ -247,12 +247,12 @@ async def download_video(
                     logger.warning(f"{error_msg} (attempt {attempt + 1}/{max_retries})")
                     continue
                 logger.error(f"{error_msg} - all retries exhausted")
-                return None, error_msg, None
+                return None, error_msg
 
             # Get the most recent file (should be only one with our download_id)
             video_file = max(files, key=lambda p: p.stat().st_mtime)
             logger.info(f"Downloaded: {video_file.name} (attempt {attempt + 1})")
-            return video_file, None, None
+            return video_file, None
 
         except Exception as e:
             error_msg = str(e)
@@ -262,7 +262,7 @@ async def download_video(
                 continue
 
     # If we've exhausted all retries
-    return None, last_error_msg or "Download failed after all retry attempts", None
+    return None, last_error_msg or "Download failed after all retry attempts"
 
 
 async def cleanup_file(file_path: Path) -> None:
@@ -499,9 +499,10 @@ async def handle_message(message: Message, bot: Bot) -> None:
     # Send status message
     status_message = await message.reply("⏳ Скачиваю видео...")
 
+    video_path: Optional[Path] = None
     try:
         # Download video
-        video_path, error_msg, _ = await download_video(video_url, use_proxy=use_proxy)
+        video_path, error_msg = await download_video(video_url, use_proxy=use_proxy)
 
         if video_path is None:
             # Логируем исходную ошибку от yt-dlp
@@ -606,6 +607,9 @@ async def handle_message(message: Message, bot: Bot) -> None:
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         await status_message.edit_text("❌ Произошла ошибка при обработке запроса.")
+        if video_path is not None:
+            await cleanup_info_json(video_path)
+            await cleanup_file(video_path)
 
 
 async def main() -> None:
