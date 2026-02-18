@@ -198,6 +198,8 @@ async def download_video(
 
             cmd.append(url)
 
+            logger.info(f"Starting yt-dlp (attempt {attempt + 1}/{max_retries}, rate-limit={current_rate_limit}): {url}")
+
             # Run yt-dlp to download video
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -206,6 +208,7 @@ async def download_video(
             )
 
             stdout, stderr = await process.communicate()
+            logger.info(f"yt-dlp finished (attempt {attempt + 1}/{max_retries}), returncode={process.returncode}")
 
             if process.returncode != 0:
                 error_msg = stderr.decode().strip()
@@ -305,8 +308,8 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
         if description is None or not isinstance(description, str) or not description.strip():
             return None
 
-        # Telegram caption limit is 4096 characters
-        return description.strip()[:4096]
+        # Telegram Bot API caption limit is 1024 characters
+        return description.strip()[:1024]
 
     except Exception as e:
         logger.warning(f"Could not extract video description: {e}")
@@ -494,7 +497,9 @@ async def handle_message(message: Message, bot: Bot) -> None:
     logger.info(f"Detected {platform} URL: {video_url}")
 
     # Check if bot can delete messages in this chat (one API call before download)
+    logger.debug(f"Checking bot delete permissions in chat {message.chat.id} (type={message.chat.type})")
     bot_can_delete = await can_bot_delete_messages(message, bot)
+    logger.debug(f"bot_can_delete={bot_can_delete}")
 
     # Send status message
     status_message = await message.reply("⏳ Скачиваю видео...")
@@ -558,11 +563,15 @@ async def handle_message(message: Message, bot: Bot) -> None:
             )
             return
 
+        logger.info(f"Video downloaded: {video_path.name} ({video_path.stat().st_size // 1024} KB)")
+
         # Extract description from info JSON (never blocks video sending)
         description = await extract_video_description(video_path)
+        logger.debug(f"Description extracted: {len(description)} chars" if description is not None else "Description: None")
 
         # Get video dimensions
         width, height = await get_video_dimensions(video_path)
+        logger.debug(f"Video dimensions: {width}x{height}")
 
         # Send video
         video_file = FSInputFile(video_path)
