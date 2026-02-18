@@ -294,7 +294,7 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
     :rtype: Optional[str]
     """
     try:
-        info_path = video_path.parent / (video_path.name + ".info.json")
+        info_path = video_path.with_suffix(".info.json")
         if not await aiofiles.os.path.exists(info_path):
             logger.debug(f"Info JSON not found: {info_path.name}")
             return None
@@ -323,7 +323,7 @@ async def cleanup_info_json(video_path: Path) -> None:
     :type video_path: Path
     :return: None
     """
-    info_path = video_path.parent / (video_path.name + ".info.json")
+    info_path = video_path.with_suffix(".info.json")
     try:
         if await aiofiles.os.path.exists(info_path):
             await aiofiles.os.remove(info_path)
