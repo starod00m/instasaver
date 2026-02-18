@@ -15,8 +15,10 @@ from typing import Optional
 
 import aiofiles.os
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import ChatMemberAdministrator, FSInputFile, Message
 from dotenv import load_dotenv
 
 from stats import GoogleSheetsStats
@@ -274,6 +276,31 @@ async def cleanup_file(file_path: Path) -> None:
         logger.error(f"Cleanup error: {e}")
 
 
+async def can_bot_delete_messages(message: Message, bot: Bot) -> bool:
+    """Check if the bot has permission to delete messages in the given chat.
+
+    Returns True only for group/supergroup chats where the bot is an
+    administrator with the can_delete_messages privilege.
+
+    :param message: Incoming message to determine the chat context
+    :type message: Message
+    :param bot: Bot instance used to query chat member info
+    :type bot: Bot
+    :return: True if the bot can delete messages, False otherwise
+    :rtype: bool
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    try:
+        bot_member = await message.chat.get_member(bot.id)
+        if isinstance(bot_member, ChatMemberAdministrator):
+            return bool(bot_member.can_delete_messages)
+        return False
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.warning(f"Could not check bot permissions in chat {message.chat.id}: {e}")
+        return False
+
+
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     """Handle /start command.
@@ -374,11 +401,13 @@ async def cmd_stats(message: Message) -> None:
 
 
 @router.message(F.text)
-async def handle_message(message: Message) -> None:
+async def handle_message(message: Message, bot: Bot) -> None:
     """Handle incoming messages and process Instagram and TikTok URLs.
 
     :param message: Incoming message
     :type message: Message
+    :param bot: Bot instance injected by aiogram
+    :type bot: Bot
     :return: None
     """
     if not message.text:
@@ -410,6 +439,9 @@ async def handle_message(message: Message) -> None:
         return
 
     logger.info(f"Detected {platform} URL: {video_url}")
+
+    # Check if bot can delete messages in this chat (one API call before download)
+    bot_can_delete = await can_bot_delete_messages(message, bot)
 
     # Send status message
     status_message = await message.reply("⏳ Скачиваю видео...")
@@ -475,16 +507,29 @@ async def handle_message(message: Message) -> None:
         # Get video dimensions
         width, height = await get_video_dimensions(video_path)
 
-        # Send video as reply to original message with correct dimensions
+        # Send video
         video_file = FSInputFile(video_path)
-        await message.reply_video(
-            video_file,
-            width=width if width > 0 else None,
-            height=height if height > 0 else None,
-        )
 
-        # Delete status message
-        await status_message.delete()
+        if bot_can_delete:
+            # Group chat, bot is admin: send without reply, then delete original message
+            await message.answer_video(
+                video_file,
+                width=width if width > 0 else None,
+                height=height if height > 0 else None,
+            )
+            await status_message.delete()
+            try:
+                await message.delete()
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                logger.warning(f"Could not delete original message {message.message_id}: {e}")
+        else:
+            # Private chat or bot without permissions: reply as before
+            await message.reply_video(
+                video_file,
+                width=width if width > 0 else None,
+                height=height if height > 0 else None,
+            )
+            await status_message.delete()
 
         # Логируем успешное скачивание в статистику (не блокирует основной функционал)
         asyncio.create_task(
