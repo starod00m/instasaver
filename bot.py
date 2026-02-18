@@ -557,6 +557,9 @@ async def handle_message(message: Message, bot: Bot) -> None:
             )
             return
 
+        # Extract description from info JSON (never blocks video sending)
+        description = await extract_video_description(video_path)
+
         # Get video dimensions
         width, height = await get_video_dimensions(video_path)
 
@@ -569,6 +572,7 @@ async def handle_message(message: Message, bot: Bot) -> None:
                 video_file,
                 width=width if width > 0 else None,
                 height=height if height > 0 else None,
+                caption=description,
             )
             await status_message.delete()
             try:
@@ -581,6 +585,7 @@ async def handle_message(message: Message, bot: Bot) -> None:
                 video_file,
                 width=width if width > 0 else None,
                 height=height if height > 0 else None,
+                caption=description,
             )
             await status_message.delete()
 
@@ -594,7 +599,8 @@ async def handle_message(message: Message, bot: Bot) -> None:
             )
         )
 
-        # Cleanup temporary file
+        # Cleanup temporary files
+        await cleanup_info_json(video_path)
         await cleanup_file(video_path)
 
     except Exception as e:
