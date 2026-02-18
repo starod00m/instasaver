@@ -302,7 +302,7 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
         data = json.loads(content)
         description = data.get("description")
 
-        if not description or not description.strip():
+        if description is None or not description.strip():
             return None
 
         # Telegram caption limit is 1024 characters
@@ -322,7 +322,7 @@ async def cleanup_info_json(video_path: Path) -> None:
     """
     info_path = video_path.with_suffix(".info.json")
     try:
-        if info_path.exists():
+        if await aiofiles.os.path.exists(info_path):
             await aiofiles.os.remove(info_path)
             logger.info(f"Cleaned up info JSON: {info_path.name}")
     except Exception as e:
@@ -501,7 +501,7 @@ async def handle_message(message: Message, bot: Bot) -> None:
 
     try:
         # Download video
-        video_path, error_msg = await download_video(video_url, use_proxy=use_proxy)
+        video_path, error_msg, _ = await download_video(video_url, use_proxy=use_proxy)
 
         if video_path is None:
             # Логируем исходную ошибку от yt-dlp
