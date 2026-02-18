@@ -5,6 +5,7 @@ and TikTok URLs, downloads videos using yt-dlp, and replies with the downloaded 
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import aiofiles
 import aiofiles.os
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -135,7 +137,7 @@ async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
 
 async def download_video(
     url: str, use_proxy: bool = False, max_retries: int = 3
-) -> tuple[Optional[Path], Optional[str]]:
+) -> tuple[Optional[Path], Optional[str], Optional[str]]:
     """Download video from Instagram or TikTok using yt-dlp with retry support.
 
     :param url: Instagram Reels/post or TikTok URL
@@ -144,8 +146,8 @@ async def download_video(
     :type use_proxy: bool
     :param max_retries: Maximum number of retry attempts
     :type max_retries: int
-    :return: Tuple of (Path to downloaded video file or None if download failed, error message or None)
-    :rtype: tuple[Optional[Path], Optional[str]]
+    :return: Tuple of (Path to downloaded video file or None, error message or None, description or None)
+    :rtype: tuple[Optional[Path], Optional[str], Optional[str]]
     """
     # Rate limits to try in order (yt-dlp format: 8M = 8 MiB/s)
     # Start with 8M, then try lower rates if rate-limit errors occur
@@ -183,6 +185,7 @@ async def download_video(
                 current_rate_limit,
                 "--output",
                 output_template,
+                "--write-info-json",
             ]
 
             # Add proxy if needed and available
@@ -233,7 +236,7 @@ async def download_video(
                         continue
 
                 # Last attempt failed
-                return None, error_msg
+                return None, error_msg, None
 
             # Find the downloaded file with download_id prefix
             files = list(TEMP_DIR.glob(f"{download_id}_*"))
@@ -244,12 +247,12 @@ async def download_video(
                     logger.warning(f"{error_msg} (attempt {attempt + 1}/{max_retries})")
                     continue
                 logger.error(f"{error_msg} - all retries exhausted")
-                return None, error_msg
+                return None, error_msg, None
 
             # Get the most recent file (should be only one with our download_id)
             video_file = max(files, key=lambda p: p.stat().st_mtime)
             logger.info(f"Downloaded: {video_file.name} (attempt {attempt + 1})")
-            return video_file, None
+            return video_file, None, None
 
         except Exception as e:
             error_msg = str(e)
@@ -259,7 +262,7 @@ async def download_video(
                 continue
 
     # If we've exhausted all retries
-    return None, last_error_msg or "Download failed after all retry attempts"
+    return None, last_error_msg or "Download failed after all retry attempts", None
 
 
 async def cleanup_file(file_path: Path) -> None:
@@ -274,6 +277,56 @@ async def cleanup_file(file_path: Path) -> None:
         logger.info(f"Cleaned up: {file_path.name}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
+
+
+async def extract_video_description(video_path: Path) -> Optional[str]:
+    """Extract video description from yt-dlp info JSON file.
+
+    Reads the .info.json file created by yt-dlp --write-info-json flag.
+    Never raises — returns None on any error so video sending is not blocked.
+
+    :param video_path: Path to the downloaded video file
+    :type video_path: Path
+    :return: Video description string or None if unavailable/empty
+    :rtype: Optional[str]
+    """
+    try:
+        info_path = video_path.with_suffix(".info.json")
+        if not info_path.exists():
+            logger.debug(f"Info JSON not found: {info_path.name}")
+            return None
+
+        async with aiofiles.open(info_path, encoding="utf-8") as f:
+            content = await f.read()
+
+        data = json.loads(content)
+        description = data.get("description")
+
+        if not description or not description.strip():
+            return None
+
+        # Telegram caption limit is 1024 characters
+        return description.strip()[:1024]
+
+    except Exception as e:
+        logger.warning(f"Could not extract video description: {e}")
+        return None
+
+
+async def cleanup_info_json(video_path: Path) -> None:
+    """Delete yt-dlp info JSON file associated with the video.
+
+    :param video_path: Path to the downloaded video file
+    :type video_path: Path
+    :return: None
+    """
+    info_path = video_path.with_suffix(".info.json")
+    try:
+        if info_path.exists():
+            await aiofiles.os.remove(info_path)
+            logger.info(f"Cleaned up info JSON: {info_path.name}")
+    except Exception as e:
+        logger.warning(f"Could not clean up info JSON {info_path.name}: {e}")
 
 
 async def can_bot_delete_messages(message: Message, bot: Bot) -> bool:
