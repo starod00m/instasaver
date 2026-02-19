@@ -5,6 +5,7 @@ and TikTok URLs, downloads videos using yt-dlp, and replies with the downloaded 
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -13,10 +14,13 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import aiofiles
 import aiofiles.os
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import ChatMemberAdministrator, FSInputFile, Message
 from dotenv import load_dotenv
 
 from stats import GoogleSheetsStats
@@ -181,6 +185,7 @@ async def download_video(
                 current_rate_limit,
                 "--output",
                 output_template,
+                "--write-info-json",
             ]
 
             # Add proxy if needed and available
@@ -193,6 +198,8 @@ async def download_video(
 
             cmd.append(url)
 
+            logger.info(f"Starting yt-dlp (attempt {attempt + 1}/{max_retries}, rate-limit={current_rate_limit}): {url}")
+
             # Run yt-dlp to download video
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -201,6 +208,7 @@ async def download_video(
             )
 
             stdout, stderr = await process.communicate()
+            logger.info(f"yt-dlp finished (attempt {attempt + 1}/{max_retries}), returncode={process.returncode}")
 
             if process.returncode != 0:
                 error_msg = stderr.decode().strip()
@@ -234,7 +242,7 @@ async def download_video(
                 return None, error_msg
 
             # Find the downloaded file with download_id prefix
-            files = list(TEMP_DIR.glob(f"{download_id}_*"))
+            files = [p for p in TEMP_DIR.glob(f"{download_id}_*") if p.suffix != ".json"]
             if not files:
                 error_msg = "No file was downloaded"
                 last_error_msg = error_msg
@@ -272,6 +280,81 @@ async def cleanup_file(file_path: Path) -> None:
         logger.info(f"Cleaned up: {file_path.name}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
+
+
+async def extract_video_description(video_path: Path) -> Optional[str]:
+    """Extract video description from yt-dlp info JSON file.
+
+    Reads the .info.json file created by yt-dlp --write-info-json flag.
+    Never raises — returns None on any error so video sending is not blocked.
+
+    :param video_path: Path to the downloaded video file
+    :type video_path: Path
+    :return: Video description string or None if unavailable/empty
+    :rtype: Optional[str]
+    """
+    try:
+        info_path = video_path.with_suffix(".info.json")
+        if not await aiofiles.os.path.exists(info_path):
+            logger.debug(f"Info JSON not found: {info_path.name}")
+            return None
+
+        async with aiofiles.open(info_path, encoding="utf-8") as f:
+            content = await f.read()
+
+        data = json.loads(content)
+        description = data.get("description")
+
+        if description is None or not isinstance(description, str) or not description.strip():
+            return None
+
+        # Telegram Bot API caption limit is 1024 characters
+        return description.strip()[:1024]
+
+    except Exception as e:
+        logger.warning(f"Could not extract video description: {e}")
+        return None
+
+
+async def cleanup_info_json(video_path: Path) -> None:
+    """Delete yt-dlp info JSON file associated with the video.
+
+    :param video_path: Path to the downloaded video file
+    :type video_path: Path
+    :return: None
+    """
+    info_path = video_path.with_suffix(".info.json")
+    try:
+        if await aiofiles.os.path.exists(info_path):
+            await aiofiles.os.remove(info_path)
+            logger.debug(f"Cleaned up info JSON: {info_path.name}")
+    except Exception as e:
+        logger.warning(f"Could not clean up info JSON {info_path.name}: {e}")
+
+
+async def can_bot_delete_messages(message: Message, bot: Bot) -> bool:
+    """Check if the bot has permission to delete messages in the given chat.
+
+    Returns True only for group/supergroup chats where the bot is an
+    administrator with the can_delete_messages privilege.
+
+    :param message: Incoming message to determine the chat context
+    :type message: Message
+    :param bot: Bot instance used to query chat member info
+    :type bot: Bot
+    :return: True if the bot can delete messages, False otherwise
+    :rtype: bool
+    """
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    try:
+        bot_member = await message.chat.get_member(bot.id)
+        if isinstance(bot_member, ChatMemberAdministrator):
+            return bool(bot_member.can_delete_messages)
+        return False
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.warning(f"Could not check bot permissions in chat {message.chat.id}: {e}")
+        return False
 
 
 @router.message(Command("start"))
@@ -374,11 +457,13 @@ async def cmd_stats(message: Message) -> None:
 
 
 @router.message(F.text)
-async def handle_message(message: Message) -> None:
+async def handle_message(message: Message, bot: Bot) -> None:
     """Handle incoming messages and process Instagram and TikTok URLs.
 
     :param message: Incoming message
     :type message: Message
+    :param bot: Bot instance injected by aiogram
+    :type bot: Bot
     :return: None
     """
     if not message.text:
@@ -411,9 +496,15 @@ async def handle_message(message: Message) -> None:
 
     logger.info(f"Detected {platform} URL: {video_url}")
 
+    # Check if bot can delete messages in this chat (one API call before download)
+    logger.debug(f"Checking bot delete permissions in chat {message.chat.id} (type={message.chat.type})")
+    bot_can_delete = await can_bot_delete_messages(message, bot)
+    logger.debug(f"bot_can_delete={bot_can_delete}")
+
     # Send status message
     status_message = await message.reply("⏳ Скачиваю видео...")
 
+    video_path: Optional[Path] = None
     try:
         # Download video
         video_path, error_msg = await download_video(video_url, use_proxy=use_proxy)
@@ -472,19 +563,41 @@ async def handle_message(message: Message) -> None:
             )
             return
 
+        logger.info(f"Video downloaded: {video_path.name} ({video_path.stat().st_size // 1024} KB)")
+
+        # Extract description from info JSON (never blocks video sending)
+        description = await extract_video_description(video_path)
+        logger.debug(f"Description extracted: {len(description)} chars" if description is not None else "Description: None")
+
         # Get video dimensions
         width, height = await get_video_dimensions(video_path)
+        logger.debug(f"Video dimensions: {width}x{height}")
 
-        # Send video as reply to original message with correct dimensions
+        # Send video
         video_file = FSInputFile(video_path)
-        await message.reply_video(
-            video_file,
-            width=width if width > 0 else None,
-            height=height if height > 0 else None,
-        )
 
-        # Delete status message
-        await status_message.delete()
+        if bot_can_delete:
+            # Group chat, bot is admin: send without reply, then delete original message
+            await message.answer_video(
+                video_file,
+                width=width if width > 0 else None,
+                height=height if height > 0 else None,
+                caption=description,
+            )
+            await status_message.delete()
+            try:
+                await message.delete()
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                logger.warning(f"Could not delete original message {message.message_id}: {e}")
+        else:
+            # Private chat or bot without permissions: reply as before
+            await message.reply_video(
+                video_file,
+                width=width if width > 0 else None,
+                height=height if height > 0 else None,
+                caption=description,
+            )
+            await status_message.delete()
 
         # Логируем успешное скачивание в статистику (не блокирует основной функционал)
         asyncio.create_task(
@@ -496,12 +609,16 @@ async def handle_message(message: Message) -> None:
             )
         )
 
-        # Cleanup temporary file
+        # Cleanup temporary files
+        await cleanup_info_json(video_path)
         await cleanup_file(video_path)
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
         await status_message.edit_text("❌ Произошла ошибка при обработке запроса.")
+        if video_path is not None:
+            await cleanup_info_json(video_path)
+            await cleanup_file(video_path)
 
 
 async def main() -> None:
