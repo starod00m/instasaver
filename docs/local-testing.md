@@ -137,8 +137,8 @@ rm .env
 
 `docker restart instasaver-local` берёт env только из того, что было
 передано в `docker run`. Если меняешь `WEBHOOK_URL` (или любой другой env)
-— нужно `docker rm -f && docker run` заново. Контейнер при этом успешно
-перерегистрирует webhook через idempotent setWebhook, если URL изменился.
+— нужно `docker rm -f && docker run` заново. Контейнер при старте всегда
+вызывает `setWebhook`, так что новые значения применятся автоматически.
 
 ### Конфликт порта `localhost:8080`
 
@@ -157,24 +157,6 @@ rm .env
 Проверить: `lsof -iTCP:8080 -sTCP:LISTEN`. Если занято чужим — использовать
 другой порт на хосте (`-p 127.0.0.1:8766:8080`). Порт внутри контейнера
 (`8080`) менять не нужно.
-
-### Ротация `WEBHOOK_SECRET` на лету ломает бота
-
-Idempotent setWebhook в `bot/__main__.py` сейчас сравнивает только URL.
-Если поменяешь **только** `WEBHOOK_SECRET` без смены URL и перезапустишь
-контейнер, то:
-
-- Бот не вызовет `set_webhook` (URL не изменился)
-- В Telegram останется старый secret
-- Бот сравнит входящий заголовок с новым secret'ом из env → 401 на всё
-- Telegram будет ретраить, ничего не будет работать
-
-Фикс: перед ротацией secret'а руками сбросить webhook:
-
-```bash
-curl -X POST "https://api.telegram.org/bot${TOKEN}/deleteWebhook"
-docker rm -f instasaver-local && docker run ...  # стартанёт с чистого
-```
 
 ### Два одновременных webhook'а на одного бота
 

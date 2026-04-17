@@ -44,12 +44,14 @@ def _configure_logging(level_name: str) -> None:
 
 
 async def _ensure_webhook(bot: Bot, config: Config) -> None:
-    """Idempotently (re)register the webhook with Telegram.
+    """Register the webhook with Telegram.
 
     If ``WEBHOOK_URL`` is not configured, this is a no-op — the bot runs in
     "dev" mode where webhook management is left to the operator (see README).
-    Otherwise the current webhook is inspected via ``getWebhookInfo`` and
-    ``setWebhook`` is called only if the URL differs.
+    Otherwise ``setWebhook`` is called unconditionally on every startup.
+    Telegram's ``setWebhook`` is idempotent, so calling it with unchanged
+    parameters is cheap and safe; calling it unconditionally also correctly
+    handles secret-token rotation (where only ``WEBHOOK_SECRET`` changes).
 
     :param bot: Bot instance.
     :type bot: Bot
@@ -61,17 +63,13 @@ async def _ensure_webhook(bot: Bot, config: Config) -> None:
         logger.warning("WEBHOOK_URL not set — skipping setWebhook (dev mode)")
         return
 
-    info = await bot.get_webhook_info()
-    if info.url != config.webhook_url:
-        logger.info(f"Updating webhook: {info.url!r} -> {config.webhook_url!r}")
-        await bot.set_webhook(
-            url=config.webhook_url,
-            secret_token=config.webhook_secret,
-            drop_pending_updates=False,
-            allowed_updates=["message", "callback_query"],
-        )
-    else:
-        logger.debug("Webhook already configured correctly")
+    logger.info(f"Registering webhook: {config.webhook_url!r}")
+    await bot.set_webhook(
+        url=config.webhook_url,
+        secret_token=config.webhook_secret,
+        drop_pending_updates=False,
+        allowed_updates=["message", "callback_query"],
+    )
 
 
 def _build_app(
