@@ -1,6 +1,11 @@
+# Local development / smoke-test compose. Production compose lives on the
+# server in /srv/bots/instasaver/compose.yml and includes the full hardening
+# stack (read_only, cap_drop, mem_limit, etc).
 services:
   instasaver-bot:
     build: .
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      - "127.0.0.1:8080:8080"

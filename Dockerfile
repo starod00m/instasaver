@@ -1,50 +1,49 @@
-# Use Python 3.13 slim image
-FROM python:3.13-slim
+# syntax=docker/dockerfile:1.7
 
-# Metadata
-LABEL maintainer="instasaver" \
-      description="Instagram Reels downloader bot for Telegram" \
-      version="0.1.0"
+# ---- Builder stage: install dependencies into a venv with uv ----
+FROM python:3.13-slim AS builder
 
-# Set working directory
-WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
 
-# Install system dependencies for yt-dlp
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Install uv with fixed version for reproducibility
+# uv pinned for reproducible builds
 COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /usr/local/bin/uv
 
-# Copy dependency files
+WORKDIR /app
+
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies using uv
-RUN uv sync --frozen --no-dev
+# Materialize dependencies into /app/.venv. --no-dev skips dev deps.
+RUN uv sync --frozen --no-dev --no-install-project
 
-# Copy application code
-COPY bot.py ./
-COPY stats.py ./
+# ---- Runtime stage ----
+FROM python:3.13-slim
 
-# Create non-root user and set up permissions
-RUN useradd -m -u 1000 -s /bin/bash botuser && \
-    mkdir -p temp && \
-    chown -R botuser:botuser /app
-
-# Switch to non-root user
-USER botuser
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     PATH="/app/.venv/bin:$PATH"
+
+# Non-root user (UID 10001 per ops runbook).
+RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the pre-built virtualenv from the builder stage.
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+
+# Copy application source.
+COPY --chown=appuser:appuser bot /app/bot
+
+USER appuser
 
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
 
-# Run the bot directly using the virtual environment
-CMD ["python", "bot.py"]
+CMD ["python", "-m", "bot"]
