@@ -1,8 +1,7 @@
-"""
-Модуль для сбора и отображения статистики использования бота.
+"""Google Sheets-based stats collection for the bot.
 
-Собирает данные о скачиваниях и ошибках в Google Sheets,
-предоставляет агрегированную статистику для админов.
+Collects download success/error events and provides aggregated stats for admin
+queries. All operations are non-blocking and never fail the main bot flow.
 """
 
 import asyncio
@@ -21,21 +20,21 @@ logger = logging.getLogger(__name__)
 
 
 class GoogleSheetsStats:
-    """
-    Класс для работы со статистикой в Google Sheets.
+    """Google Sheets stats client.
 
-    Записывает события скачиваний и ошибок в реальном времени,
-    предоставляет агрегированную статистику за период.
-    Все операции выполняются неблокирующе и не влияют на основной функционал бота.
+    Writes download events in real time and returns aggregated stats for a
+    given window. All operations are non-blocking and never affect the main
+    bot flow.
     """
 
     def __init__(self) -> None:
-        """
-        Инициализация клиента Google Sheets.
+        """Initialize the Google Sheets client.
 
-        Использует credentials из переменной окружения GOOGLE_CREDENTIALS_JSON_BASE64.
-        Credentials должны быть в формате Base64-кодированного JSON.
-        При ошибках инициализации логирует предупреждение, но не падает.
+        Reads credentials from ``GOOGLE_CREDENTIALS_JSON_BASE64`` and the sheet
+        id from ``GOOGLE_SHEETS_SPREADSHEET_ID``. Initialization failures are
+        logged as warnings and stats collection is disabled silently.
+
+        :return: None
         """
         self.client: Optional[gspread.Client] = None
         self.spreadsheet: Optional[gspread.Spreadsheet] = None
@@ -59,7 +58,6 @@ class GoogleSheetsStats:
 
             logger.info("Initializing Google Sheets stats...")
 
-            # Декодирование credentials из Base64 и парсинг JSON
             credentials_json = base64.b64decode(credentials_json_b64).decode("utf-8")
             credentials_dict = json.loads(credentials_json)
             logger.debug(
@@ -72,14 +70,12 @@ class GoogleSheetsStats:
             )
             logger.debug("Service account credentials created")
 
-            # Инициализация клиента
             self.client = gspread.authorize(credentials)
             logger.debug("Google Sheets client authorized")
 
             self.spreadsheet = self.client.open_by_key(spreadsheet_id)
             logger.info(f"Connected to spreadsheet: {self.spreadsheet.title}")
 
-            # Получаем первый лист (Events)
             self.worksheet = self.spreadsheet.sheet1
             logger.info(f"Using worksheet: {self.worksheet.title}")
 
@@ -105,13 +101,17 @@ class GoogleSheetsStats:
     async def log_download_success(
         self, user_id: int, chat_id: int, platform: str, url: str
     ) -> None:
-        """
-        Записывает успешное скачивание в статистику.
+        """Log a successful download event.
 
-        :param user_id: ID пользователя Telegram
-        :param chat_id: ID чата
-        :param platform: Платформа (Instagram/TikTok)
-        :param url: URL видео
+        :param user_id: Telegram user id.
+        :type user_id: int
+        :param chat_id: Telegram chat id.
+        :type chat_id: int
+        :param platform: Platform label (e.g. ``Instagram``/``TikTok``).
+        :type platform: str
+        :param url: Video URL.
+        :type url: str
+        :return: None
         """
         if not self._initialized:
             logger.debug("Stats not initialized, skipping log_download_success")
@@ -120,14 +120,14 @@ class GoogleSheetsStats:
         try:
             now = datetime.utcnow()
             row = [
-                now.isoformat() + "Z",  # Timestamp
-                now.strftime("%Y-%m-%d"),  # Date
+                now.isoformat() + "Z",
+                now.strftime("%Y-%m-%d"),
                 str(user_id),
                 str(chat_id),
                 platform,
                 url,
                 "success",
-                "",  # Empty error message
+                "",
             ]
 
             logger.debug(
@@ -150,14 +150,19 @@ class GoogleSheetsStats:
     async def log_download_error(
         self, user_id: int, chat_id: int, platform: str, url: str, error_msg: str
     ) -> None:
-        """
-        Записывает ошибку скачивания в статистику.
+        """Log a failed download event.
 
-        :param user_id: ID пользователя Telegram
-        :param chat_id: ID чата
-        :param platform: Платформа (Instagram/TikTok)
-        :param url: URL видео
-        :param error_msg: Сообщение об ошибке
+        :param user_id: Telegram user id.
+        :type user_id: int
+        :param chat_id: Telegram chat id.
+        :type chat_id: int
+        :param platform: Platform label (e.g. ``Instagram``/``TikTok``).
+        :type platform: str
+        :param url: Video URL.
+        :type url: str
+        :param error_msg: Error message (truncated to 500 chars before writing).
+        :type error_msg: str
+        :return: None
         """
         if not self._initialized:
             logger.debug("Stats not initialized, skipping log_download_error")
@@ -167,14 +172,14 @@ class GoogleSheetsStats:
             now = datetime.utcnow()
             truncated_error = error_msg[:500] if error_msg else "Unknown error"
             row = [
-                now.isoformat() + "Z",  # Timestamp
-                now.strftime("%Y-%m-%d"),  # Date
+                now.isoformat() + "Z",
+                now.strftime("%Y-%m-%d"),
                 str(user_id),
                 str(chat_id),
                 platform,
                 url,
                 "error",
-                truncated_error,  # Ограничиваем длину сообщения об ошибке
+                truncated_error,
             ]
 
             logger.debug(
@@ -195,20 +200,23 @@ class GoogleSheetsStats:
             )
 
     def _append_row(self, row: list) -> None:
-        """
-        Синхронная запись строки в Google Sheets.
+        """Append a row to the worksheet synchronously.
 
-        :param row: Список значений для записи
+        :param row: List of values to append.
+        :type row: list
+        :return: None
         """
         if self.worksheet:
             self.worksheet.append_row(row, value_input_option="RAW")
 
     async def get_stats(self, days: int = 30) -> Optional[dict]:
-        """
-        Получает статистику за указанное количество дней.
+        """Return aggregated stats for the last ``days`` days.
 
-        :param days: Количество дней для анализа
-        :return: Словарь со статистикой или None при ошибке
+        :param days: Number of days to include in the aggregation window.
+        :type days: int
+        :return: Stats dict, or ``None`` if Google Sheets is not initialized
+            or the API call fails.
+        :rtype: Optional[dict]
         """
         if not self._initialized:
             logger.warning("Google Sheets not initialized, cannot get stats")
@@ -217,7 +225,6 @@ class GoogleSheetsStats:
         try:
             logger.info(f"Fetching stats for last {days} days...")
 
-            # Получаем все данные
             all_records = await asyncio.to_thread(self.worksheet.get_all_records)
             logger.debug(
                 f"Retrieved {len(all_records)} total records from Google Sheets"
@@ -234,7 +241,6 @@ class GoogleSheetsStats:
                     "daily_stats": [],
                 }
 
-            # Фильтруем по дате
             cutoff_date = datetime.utcnow() - timedelta(days=days)
             cutoff_str = cutoff_date.strftime("%Y-%m-%d")
             logger.debug(f"Filtering records from {cutoff_str} onwards")
@@ -246,15 +252,12 @@ class GoogleSheetsStats:
                 f"Filtered to {len(filtered_records)} records within {days} days"
             )
 
-            # Подсчет статистики
             total = len(filtered_records)
             success = sum(1 for r in filtered_records if r.get("Status") == "success")
             errors = sum(1 for r in filtered_records if r.get("Status") == "error")
 
-            # Уникальные чаты
             unique_chats = len(set(str(r.get("Chat ID", "")) for r in filtered_records))
 
-            # Топ типов ошибок
             error_messages = [
                 r.get("Error Message", "Unknown error")
                 for r in filtered_records
@@ -263,7 +266,6 @@ class GoogleSheetsStats:
             error_counter = Counter(error_messages)
             error_types = dict(error_counter.most_common(5))
 
-            # Статистика по дням
             daily_data = {}
             for record in filtered_records:
                 date = record.get("Date", "")
@@ -279,7 +281,6 @@ class GoogleSheetsStats:
                 else:
                     daily_data[date]["errors"] += 1
 
-            # Сортируем по дате (последние дни сверху)
             daily_stats = [
                 {"date": date, **stats}
                 for date, stats in sorted(
@@ -299,7 +300,7 @@ class GoogleSheetsStats:
                 "errors": errors,
                 "unique_chats": unique_chats,
                 "error_types": error_types,
-                "daily_stats": daily_stats[:7],  # Последние 7 дней
+                "daily_stats": daily_stats[:7],
             }
 
         except gspread.exceptions.APIError as e:
@@ -312,11 +313,12 @@ class GoogleSheetsStats:
 
     @staticmethod
     def format_stats_message(stats: dict) -> str:
-        """
-        Форматирует статистику для отображения в Telegram.
+        """Format aggregated stats as an HTML message for Telegram.
 
-        :param stats: Словарь со статистикой
-        :return: Отформатированное сообщение в HTML формате
+        :param stats: Stats dict as returned by :meth:`get_stats`.
+        :type stats: dict
+        :return: HTML-formatted message body.
+        :rtype: str
         """
         total = stats["total"]
         success = stats["success"]
@@ -337,15 +339,12 @@ class GoogleSheetsStats:
 
 👥 Уникальных чатов: {unique_chats}"""
 
-        # Добавляем топ ошибок, если есть
         if stats["error_types"]:
             message += "\n\n🔝 <b>Типы ошибок:</b>"
             for error_msg, count in list(stats["error_types"].items())[:5]:
-                # Обрезаем длинные сообщения
                 short_msg = error_msg[:60] + "..." if len(error_msg) > 60 else error_msg
                 message += f"\n• {short_msg}: {count}"
 
-        # Добавляем статистику по дням
         if stats["daily_stats"]:
             message += "\n\n📈 <b>По дням (последние 7):</b>"
             for day_stat in stats["daily_stats"]:
