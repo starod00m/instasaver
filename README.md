@@ -171,16 +171,17 @@ PROXY_URL=socks5://proxy_user:your_password@your_proxy_host:port
 
 ### Режим 2: Локальный запуск для отладки
 
+Полная процедура с граблями и разборкой — в
+[`docs/local-testing.md`](docs/local-testing.md). Вкратце:
+
 ```bash
-# 1. Поднять локальный туннель (например, cloudflared или ngrok)
-cloudflared tunnel --url http://localhost:8080
+# 1. Поднять локальный туннель через VPN (чтобы edge был в Европе, а не в Азии)
+cloudflared tunnel --url http://localhost:8766 --protocol http2
 
-# 2. Прописать полученный HTTPS URL в .env
-#    WEBHOOK_URL=https://<random>.trycloudflare.com/webhook
-#    WEBHOOK_SECRET=$(openssl rand -hex 32)
-
-# 3. Запустить бота
-uv run python -m bot
+# 2. Прописать полученный HTTPS URL в .env как WEBHOOK_URL, добавить WEBHOOK_SECRET
+# 3. Запустить через Docker на порту 8766 (избежать конфликтов):
+docker build -t instasaver:local .
+docker run -d --name instasaver-local --env-file .env -p 127.0.0.1:8766:8080 instasaver:local
 ```
 
 Если нужно поднять только HTTP-сервер без обращения к Telegram (например,
