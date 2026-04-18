@@ -14,13 +14,16 @@ import asyncio
 import logging
 import signal
 import sys
+from typing import Optional
 
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiohttp import web
 
 from bot.config import Config
 from bot.handlers import router
 from bot.health import health_handler
+from bot.hikerapi_client import HikerAPIClient
 from bot.stats import GoogleSheetsStats
 from bot.webhook import make_webhook_handler
 
@@ -120,9 +123,31 @@ async def _run() -> None:
     dispatcher = Dispatcher()
     dispatcher.include_router(router=router)
 
+    # Shared aiohttp session used by the direct-CDN downloader and HikerAPI
+    # client. Created inside the event loop (Python 3.13 complains about
+    # creating ClientSession at import time or before the loop is running),
+    # closed in the shutdown branch below.
+    http_session = aiohttp.ClientSession()
+
+    hikerapi_client: Optional[HikerAPIClient]
+    if config.hikerapi_key is not None:
+        hikerapi_client = HikerAPIClient(
+            session=http_session,
+            api_key=config.hikerapi_key,
+        )
+        logger.info("HikerAPI client initialised")
+    else:
+        hikerapi_client = None
+        logger.warning(
+            "HIKERAPI_KEY not set — Instagram URLs will not be processed "
+            "(TikTok still works via yt-dlp)"
+        )
+
     # Inject per-request dependencies consumed by handlers via aiogram DI.
     dispatcher["config"] = config
     dispatcher["stats_tracker"] = stats_tracker
+    dispatcher["hikerapi_client"] = hikerapi_client
+    dispatcher["http_session"] = http_session
 
     app = _build_app(dispatcher=dispatcher, bot=bot, config=config)
 
@@ -175,6 +200,7 @@ async def _run() -> None:
             logger.warning("Shutdown: drain deadline exceeded, forcing stop")
         finally:
             await bot.session.close()
+            await http_session.close()
             logger.info("Bot stopped")
 
 

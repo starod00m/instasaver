@@ -14,6 +14,7 @@ from typing import Optional
 
 import aiofiles
 import aiofiles.os
+import aiohttp
 from aiogram import Bot
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -103,7 +104,9 @@ async def download_video(
 
     for attempt in range(max_retries):
         try:
-            current_rate_limit = rate_limits[min(current_rate_limit_index, len(rate_limits) - 1)]
+            current_rate_limit = rate_limits[
+                min(current_rate_limit_index, len(rate_limits) - 1)
+            ]
 
             if attempt > 0:
                 logger.info(
@@ -181,7 +184,9 @@ async def download_video(
 
                 return None, error_msg
 
-            files = [p for p in temp_dir.glob(f"{download_id}_*") if p.suffix != ".json"]
+            files = [
+                p for p in temp_dir.glob(f"{download_id}_*") if p.suffix != ".json"
+            ]
             if not files:
                 error_msg = "No file was downloaded"
                 last_error_msg = error_msg
@@ -198,11 +203,90 @@ async def download_video(
         except Exception as e:
             error_msg = str(e)
             last_error_msg = error_msg
-            logger.error(f"Download error (attempt {attempt + 1}/{max_retries}): {error_msg}")
+            logger.error(
+                f"Download error (attempt {attempt + 1}/{max_retries}): {error_msg}"
+            )
             if attempt < max_retries - 1:
                 continue
 
     return None, last_error_msg or "Download failed after all retry attempts"
+
+
+async def download_direct_url(
+    direct_url: str,
+    temp_dir: Path,
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Download an mp4 file directly from a CDN URL, streaming into a file.
+
+    Intended for URLs resolved through HikerAPI (see
+    :class:`bot.hikerapi_client.HikerAPIClient`). Does **not** use yt-dlp —
+    this is a plain chunked HTTP GET against Meta's CDN.
+
+    :param direct_url: Fully-qualified CDN URL of the mp4 to download.
+    :type direct_url: str
+    :param temp_dir: Directory to place the downloaded file in.
+    :type temp_dir: Path
+    :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
+    :type session: aiohttp.ClientSession
+    :return: ``(path_to_video, error_msg)``. On success the second element
+        is ``None``; on failure the first element is ``None``.
+    :rtype: tuple[Optional[Path], Optional[str]]
+    """
+    download_id = str(uuid.uuid4())[:8]
+    target_path = temp_dir / f"{download_id}_hikerapi.mp4"
+    # 60 seconds on the total download is plenty for a typical reel (~5-40 MB).
+    timeout = aiohttp.ClientTimeout(total=60)
+    # 1 MiB chunks — good balance between syscall overhead and memory use.
+    chunk_size = 1024 * 1024
+
+    try:
+        async with session.get(url=direct_url, timeout=timeout) as response:
+            if response.status != 200:
+                logger.error(
+                    f"Direct download HTTP {response.status} for {target_path.name}"
+                )
+                return None, f"http_{response.status}"
+
+            total_bytes = 0
+            async with aiofiles.open(target_path, mode="wb") as f:
+                async for chunk in response.content.iter_chunked(n=chunk_size):
+                    await f.write(chunk)
+                    total_bytes += len(chunk)
+
+            logger.info(
+                f"Direct download finished: {target_path.name} "
+                f"({total_bytes // 1024} KB)"
+            )
+            return target_path, None
+
+    except TimeoutError:
+        logger.error(f"Direct download timeout for {target_path.name}")
+        # Clean up partial file if present.
+        await _remove_if_exists(path=target_path)
+        return None, "timeout"
+    except aiohttp.ClientError as e:
+        logger.error(f"Direct download network error: {e}")
+        await _remove_if_exists(path=target_path)
+        return None, f"network_error: {e}"
+    except Exception as e:
+        logger.error(f"Direct download unexpected error: {e}")
+        await _remove_if_exists(path=target_path)
+        return None, f"unexpected: {e}"
+
+
+async def _remove_if_exists(path: Path) -> None:
+    """Remove a file if it exists, swallowing errors.
+
+    :param path: Path to the file to delete.
+    :type path: Path
+    :return: None
+    """
+    try:
+        if await aiofiles.os.path.exists(path):
+            await aiofiles.os.remove(path)
+    except Exception as e:
+        logger.warning(f"Could not remove partial file {path.name}: {e}")
 
 
 async def cleanup_file(file_path: Path) -> None:
@@ -243,7 +327,11 @@ async def extract_video_description(video_path: Path) -> Optional[str]:
         data = json.loads(content)
         description = data.get("description")
 
-        if description is None or not isinstance(description, str) or not description.strip():
+        if (
+            description is None
+            or not isinstance(description, str)
+            or not description.strip()
+        ):
             return None
 
         # Telegram Bot API caption limit for media is 1024 characters.
@@ -291,5 +379,7 @@ async def can_bot_delete_messages(message: Message, bot: Bot) -> bool:
             return bool(bot_member.can_delete_messages)
         return False
     except (TelegramBadRequest, TelegramForbiddenError) as e:
-        logger.warning(f"Could not check bot permissions in chat {message.chat.id}: {e}")
+        logger.warning(
+            f"Could not check bot permissions in chat {message.chat.id}: {e}"
+        )
         return False

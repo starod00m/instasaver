@@ -71,8 +71,19 @@ class Config:
         self.port: int = int(_get_optional(name="PORT", default="8080"))
         self.log_level: str = _get_optional(name="LOG_LEVEL", default="INFO").upper()
 
-        self.proxy_url: Optional[str] = _get_optional(name="PROXY_URL", default="") or None
-        self.admin_user_id: Optional[str] = _get_optional(name="ADMIN_USER_ID", default="") or None
+        self.proxy_url: Optional[str] = (
+            _get_optional(name="PROXY_URL", default="") or None
+        )
+        self.admin_user_id: Optional[str] = (
+            _get_optional(name="ADMIN_USER_ID", default="") or None
+        )
+
+        # HikerAPI key для скачивания Instagram-видео. Если не задан, Instagram-
+        # ссылки обрабатываться не будут (см. bot/handlers.py). Бот всё равно
+        # запускается — TikTok через yt-dlp остаётся работоспособным.
+        self.hikerapi_key: Optional[str] = (
+            _get_optional(name="HIKERAPI_KEY", default="") or None
+        )
 
         self.google_credentials_json_base64: Optional[str] = (
             _get_optional(name="GOOGLE_CREDENTIALS_JSON_BASE64", default="") or None

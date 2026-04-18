@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
@@ -22,10 +23,12 @@ from bot.downloader import (
     can_bot_delete_messages,
     cleanup_file,
     cleanup_info_json,
+    download_direct_url,
     download_video,
     extract_video_description,
     get_video_dimensions,
 )
+from bot.hikerapi_client import HikerAPIClient
 from bot.stats import GoogleSheetsStats
 
 logger = logging.getLogger(__name__)
@@ -159,8 +162,15 @@ async def handle_message(
     bot: Bot,
     config: Config,
     stats_tracker: GoogleSheetsStats,
+    hikerapi_client: Optional[HikerAPIClient],
+    http_session: aiohttp.ClientSession,
 ) -> None:
     """Handle plain text messages, extract Instagram/TikTok URLs, send videos.
+
+    Instagram URLs are resolved through :class:`HikerAPIClient` (Meta CDN
+    direct mp4 URL) and downloaded via :func:`download_direct_url`. TikTok
+    URLs keep the original ``yt-dlp`` path through :func:`download_video`,
+    since yt-dlp + proxy works for TikTok in our deployment environment.
 
     :param message: Incoming message.
     :type message: Message
@@ -170,6 +180,12 @@ async def handle_message(
     :type config: Config
     :param stats_tracker: Google Sheets stats client injected by the dispatcher.
     :type stats_tracker: GoogleSheetsStats
+    :param hikerapi_client: HikerAPI client injected by the dispatcher; may be
+        ``None`` when ``HIKERAPI_KEY`` is unset — in that case Instagram URLs
+        get a configuration-error message back.
+    :type hikerapi_client: Optional[HikerAPIClient]
+    :param http_session: Shared aiohttp session for direct CDN downloads.
+    :type http_session: aiohttp.ClientSession
     :return: None
     """
     if message.text is None:
@@ -185,16 +201,13 @@ async def handle_message(
 
     video_url: Optional[str] = None
     platform: Optional[str] = None
-    use_proxy = False
 
     if instagram_match is not None:
         video_url = instagram_match.group(0)
         platform = "Instagram"
-        use_proxy = False
     elif tiktok_match is not None:
         video_url = tiktok_match.group(0)
         platform = "TikTok"
-        use_proxy = True  # TikTok requires a proxy in most regions
 
     if video_url is None or platform is None:
         return
@@ -212,12 +225,21 @@ async def handle_message(
 
     video_path: Optional[Path] = None
     try:
-        video_path, error_msg = await download_video(
-            url=video_url,
-            temp_dir=config.temp_dir,
-            proxy_url=config.proxy_url,
-            use_proxy=use_proxy,
-        )
+        if platform == "Instagram":
+            video_path, error_msg = await _download_instagram(
+                instagram_url=video_url,
+                temp_dir=config.temp_dir,
+                hikerapi_client=hikerapi_client,
+                http_session=http_session,
+            )
+        else:
+            # TikTok — unchanged yt-dlp path with proxy.
+            video_path, error_msg = await download_video(
+                url=video_url,
+                temp_dir=config.temp_dir,
+                proxy_url=config.proxy_url,
+                use_proxy=True,
+            )
 
         if video_path is None:
             logger.error(
@@ -230,7 +252,45 @@ async def handle_message(
             if error_msg is not None:
                 error_msg_lower = error_msg.lower()
 
-                if (
+                # HikerAPI-specific structured error codes (see
+                # bot/hikerapi_client.py: get_reel_media_url / _extract_video_url).
+                if error_msg == "hikerapi_key_missing":
+                    error_text = (
+                        "⚙️ Instagram временно не обслуживается: не задан "
+                        "HIKERAPI_KEY. Сообщите администратору."
+                    )
+                    logger.error(
+                        f"HIKERAPI_KEY not configured — Instagram request "
+                        f"rejected for URL: {video_url}"
+                    )
+                elif error_msg == "not_found":
+                    error_text += "\n\n🚫 Пост недоступен или был удалён."
+                    logger.info(f"HikerAPI not_found for URL: {video_url}")
+                elif error_msg == "rate_limited":
+                    error_text += (
+                        "\n\n⏱️ Сервис временно перегружен, попробуйте через минуту."
+                    )
+                    logger.warning(f"HikerAPI rate_limited for URL: {video_url}")
+                elif error_msg == "payment_required":
+                    error_text += (
+                        "\n\n💳 Временные проблемы с сервисом, сообщите администратору."
+                    )
+                    logger.error(
+                        f"HikerAPI payment_required (free tier exhausted?) "
+                        f"for URL: {video_url}"
+                    )
+                elif error_msg == "unauthorized":
+                    error_text += (
+                        "\n\n🔑 Сервис отклонил авторизацию, сообщите администратору."
+                    )
+                    logger.error(f"HikerAPI unauthorized for URL: {video_url}")
+                elif error_msg == "no_video_url":
+                    error_text += "\n\n🖼️ В посте нет видео для скачивания."
+                    logger.info(f"HikerAPI no video in media for URL: {video_url}")
+                elif error_msg == "timeout":
+                    error_text += "\n\n⏳ Не удалось получить видео, попробуйте позже."
+                    logger.warning(f"HikerAPI timeout for URL: {video_url}")
+                elif (
                     "this content may be inappropriate" in error_msg_lower
                     or "inappropriate" in error_msg_lower
                 ):
@@ -244,29 +304,24 @@ async def handle_message(
                         "\n\n🔒 Видео является приватным и недоступно для скачивания."
                     )
                     logger.info(f"Private content error for URL: {video_url}")
-                elif "not available" in error_msg_lower or "unavailable" in error_msg_lower:
-                    error_text += (
-                        "\n\n🚫 Видео недоступно. Возможно, оно было удалено или скрыто автором."
-                    )
+                elif (
+                    "not available" in error_msg_lower
+                    or "unavailable" in error_msg_lower
+                ):
+                    error_text += "\n\n🚫 Видео недоступно. Возможно, оно было удалено или скрыто автором."
                     logger.info(f"Content not available for URL: {video_url}")
                 elif "age" in error_msg_lower and "restrict" in error_msg_lower:
-                    error_text += (
-                        "\n\n🔞 Видео имеет возрастные ограничения и требует входа в аккаунт."
-                    )
+                    error_text += "\n\n🔞 Видео имеет возрастные ограничения и требует входа в аккаунт."
                     logger.info(f"Age-restricted content for URL: {video_url}")
                 elif "login" in error_msg_lower or "sign in" in error_msg_lower:
-                    error_text += (
-                        "\n\n🔑 Для скачивания этого видео требуется авторизация в аккаунте."
-                    )
+                    error_text += "\n\n🔑 Для скачивания этого видео требуется авторизация в аккаунте."
                     logger.info(f"Login required for URL: {video_url}")
                 elif (
                     "geo" in error_msg_lower
                     or "region" in error_msg_lower
                     or "country" in error_msg_lower
                 ):
-                    error_text += (
-                        "\n\n🌍 Видео недоступно в вашем регионе из-за географических ограничений."
-                    )
+                    error_text += "\n\n🌍 Видео недоступно в вашем регионе из-за географических ограничений."
                     logger.info(f"Geo-restricted content for URL: {video_url}")
                 elif (
                     "429" in error_msg
@@ -281,8 +336,12 @@ async def handle_message(
                     error_text += f"\n\n⚠️ Техническая информация:\n{error_msg}"
                     logger.warning(f"Unknown error type for URL: {video_url}")
             else:
-                error_text += "\n\n❓ Возможно, контент недоступен или является приватным."
-                logger.warning(f"No error message provided for failed download: {video_url}")
+                error_text += (
+                    "\n\n❓ Возможно, контент недоступен или является приватным."
+                )
+                logger.warning(
+                    f"No error message provided for failed download: {video_url}"
+                )
 
             await status_message.edit_text(text=error_text)
 
@@ -349,7 +408,54 @@ async def handle_message(
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
-        await status_message.edit_text(text="❌ Произошла ошибка при обработке запроса.")
+        await status_message.edit_text(
+            text="❌ Произошла ошибка при обработке запроса."
+        )
         if video_path is not None:
             await cleanup_info_json(video_path=video_path)
             await cleanup_file(file_path=video_path)
+
+
+async def _download_instagram(
+    instagram_url: str,
+    temp_dir: Path,
+    hikerapi_client: Optional[HikerAPIClient],
+    http_session: aiohttp.ClientSession,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve an Instagram URL through HikerAPI and download the mp4 directly.
+
+    No ``yt-dlp`` fallback: in the environments that need HikerAPI, yt-dlp
+    against Instagram is known to fail with rate-limit/login-required.
+    Adding it here would just add latency and noisier logs.
+
+    :param instagram_url: Instagram reel/post URL matched by the handler.
+    :type instagram_url: str
+    :param temp_dir: Directory to place downloaded files in.
+    :type temp_dir: Path
+    :param hikerapi_client: Configured HikerAPI client, or ``None`` when
+        ``HIKERAPI_KEY`` is not set.
+    :type hikerapi_client: Optional[HikerAPIClient]
+    :param http_session: Shared aiohttp session for the direct CDN download.
+    :type http_session: aiohttp.ClientSession
+    :return: ``(path_to_video, error_msg)``. On success the second element
+        is ``None``. On failure the first element is ``None`` and the error
+        string is one of the HikerAPI-specific codes (``not_found``,
+        ``rate_limited``, ``payment_required``, ``unauthorized``,
+        ``no_video_url``, ``timeout``, ``hikerapi_key_missing``) or a
+        free-form network error.
+    :rtype: tuple[Optional[Path], Optional[str]]
+    """
+    if hikerapi_client is None:
+        return None, "hikerapi_key_missing"
+
+    direct_url, error_msg = await hikerapi_client.get_reel_media_url(
+        instagram_url=instagram_url,
+    )
+    if direct_url is None:
+        return None, error_msg
+
+    return await download_direct_url(
+        direct_url=direct_url,
+        temp_dir=temp_dir,
+        session=http_session,
+    )
