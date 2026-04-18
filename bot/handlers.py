@@ -267,11 +267,18 @@ async def handle_message(
             f"Video downloaded: {video_path.name} ({video_path.stat().st_size // 1024} KB)"
         )
 
-        description = await extract_video_description(video_path=video_path)
-        if description is not None:
-            logger.debug(f"Description extracted: {len(description)} chars")
+        # Instagram path goes through HikerAPI + direct CDN download, so there's
+        # no yt-dlp .info.json file — caption is just the original reel URL so
+        # the user can jump back to the source. TikTok still uses yt-dlp and
+        # keeps its richer description.
+        if platform == "Instagram":
+            description: Optional[str] = video_url
         else:
-            logger.debug("Description: None")
+            description = await extract_video_description(video_path=video_path)
+            if description is not None:
+                logger.debug(f"Description extracted: {len(description)} chars")
+            else:
+                logger.debug("Description: None")
 
         width, height = await get_video_dimensions(video_path=video_path)
         logger.debug(f"Video dimensions: {width}x{height}")
