@@ -11,6 +11,7 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiofiles
 import aiofiles.os
@@ -21,6 +22,18 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import ChatMemberAdministrator, Message
 
 logger = logging.getLogger(__name__)
+
+# Hosts we accept as sources for direct CDN downloads. HikerAPI should only
+# ever hand us URLs on Meta's CDN; anything else (metadata endpoints, internal
+# hosts, file://) must be refused without a request being made. We match on
+# suffix to cover *.cdninstagram.com, *.fbcdn.net, scontent-*.fbcdn.net etc.
+_ALLOWED_DIRECT_URL_HOST_SUFFIXES: tuple[str, ...] = (
+    ".cdninstagram.com",
+    ".fbcdn.net",
+)
+# Hard cap on mp4 size. Telegram Bot API refuses files >50 MiB for bots; even
+# without that, an unbounded download would let an attacker fill tmpfs.
+_DIRECT_DOWNLOAD_MAX_BYTES: int = 50 * 1024 * 1024
 
 
 async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
@@ -212,47 +225,123 @@ async def download_video(
     return None, last_error_msg or "Download failed after all retry attempts"
 
 
+def _is_allowed_direct_url(direct_url: str) -> bool:
+    """Return True if ``direct_url`` is safe to fetch from the bot process.
+
+    Enforces: scheme ``https://``, host ending in one of the Meta CDN
+    suffixes. Anything else (``http://169.254.169.254``, ``file://``,
+    ``localhost``) is refused — HikerAPI is an external dependency and its
+    response must not be allowed to SSRF the deployment host.
+
+    :param direct_url: URL string returned by HikerAPI.
+    :return: True iff the URL passes the allowlist.
+    """
+    try:
+        parsed = urlparse(direct_url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname
+    if host is None:
+        return False
+    host = host.lower()
+    return any(
+        host == s[1:] or host.endswith(s) for s in _ALLOWED_DIRECT_URL_HOST_SUFFIXES
+    )
+
+
 async def download_direct_url(
     direct_url: str,
     temp_dir: Path,
     session: aiohttp.ClientSession,
 ) -> tuple[Optional[Path], Optional[str]]:
-    """Download an mp4 file directly from a CDN URL, streaming into a file.
+    """Download an mp4 file directly from a Meta CDN URL, streaming into a file.
 
     Intended for URLs resolved through HikerAPI (see
-    :class:`bot.hikerapi_client.HikerAPIClient`). Does **not** use yt-dlp —
-    this is a plain chunked HTTP GET against Meta's CDN.
+    :class:`bot.hikerapi_client.HikerAPIClient`). Does **not** use yt-dlp.
+
+    Enforces an SSRF allowlist (``*.cdninstagram.com`` / ``*.fbcdn.net``, https
+    only), caps total size at 50 MiB, and retries once on a 403 (CDN cookies
+    for HikerAPI's account can briefly go stale between resolve and fetch).
 
     :param direct_url: Fully-qualified CDN URL of the mp4 to download.
-    :type direct_url: str
     :param temp_dir: Directory to place the downloaded file in.
-    :type temp_dir: Path
     :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
-    :type session: aiohttp.ClientSession
-    :return: ``(path_to_video, error_msg)``. On success the second element
-        is ``None``; on failure the first element is ``None``.
-    :rtype: tuple[Optional[Path], Optional[str]]
+    :return: ``(path_to_video, error_code)``. On success ``error_code`` is
+        ``None``; on failure ``path_to_video`` is ``None`` and ``error_code``
+        is one of ``disallowed_host``, ``forbidden``, ``file_too_large``,
+        ``timeout``, ``technical_error``.
+    """
+    if not _is_allowed_direct_url(direct_url=direct_url):
+        parsed_host = urlparse(direct_url).hostname or "<unparseable>"
+        logger.error(f"Direct download refused: host not on allowlist: {parsed_host}")
+        return None, "disallowed_host"
+
+    # One retry on 403: mirrors the ТЗ edge case where HikerAPI's CDN cookie
+    # briefly expires between URL resolution and the actual GET. Anything else
+    # is a terminal error.
+    max_attempts = 2
+    last_error: Optional[str] = None
+    for attempt in range(max_attempts):
+        path, error_code = await _attempt_direct_download(
+            direct_url=direct_url,
+            temp_dir=temp_dir,
+            session=session,
+        )
+        if path is not None:
+            return path, None
+        last_error = error_code
+        if error_code == "forbidden" and attempt + 1 < max_attempts:
+            logger.warning(
+                f"Direct download got 403, retrying once (attempt {attempt + 2}/{max_attempts})"
+            )
+            await asyncio.sleep(1)
+            continue
+        break
+    return None, last_error
+
+
+async def _attempt_direct_download(
+    direct_url: str,
+    temp_dir: Path,
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Single-shot chunked mp4 download with size cap. Internal helper.
+
+    :param direct_url: Pre-validated CDN URL.
+    :param temp_dir: Directory to place the downloaded file in.
+    :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
+    :return: ``(path, None)`` on success; ``(None, error_code)`` on any
+        failure, with the partial file cleaned up.
     """
     download_id = str(uuid.uuid4())[:8]
     target_path = temp_dir / f"{download_id}_hikerapi.mp4"
-    # 60 seconds on the total download is plenty for a typical reel (~5-40 MB).
     timeout = aiohttp.ClientTimeout(total=60)
-    # 1 MiB chunks — good balance between syscall overhead and memory use.
     chunk_size = 1024 * 1024
 
     try:
         async with session.get(url=direct_url, timeout=timeout) as response:
-            if response.status != 200:
-                logger.error(
-                    f"Direct download HTTP {response.status} for {target_path.name}"
-                )
-                return None, f"http_{response.status}"
+            status = response.status
+            if status != 200:
+                logger.error(f"Direct download HTTP {status} for {target_path.name}")
+                if status == 403:
+                    return None, "forbidden"
+                return None, "technical_error"
 
             total_bytes = 0
             async with aiofiles.open(target_path, mode="wb") as f:
                 async for chunk in response.content.iter_chunked(n=chunk_size):
-                    await f.write(chunk)
                     total_bytes += len(chunk)
+                    if total_bytes > _DIRECT_DOWNLOAD_MAX_BYTES:
+                        logger.error(
+                            f"Direct download exceeded {_DIRECT_DOWNLOAD_MAX_BYTES} B, aborting"
+                        )
+                        # Abort the chunked read. The response context manager
+                        # releases the connection; partial file is cleaned below.
+                        await _remove_if_exists(path=target_path)
+                        return None, "file_too_large"
+                    await f.write(chunk)
 
             logger.info(
                 f"Direct download finished: {target_path.name} "
@@ -262,17 +351,17 @@ async def download_direct_url(
 
     except TimeoutError:
         logger.error(f"Direct download timeout for {target_path.name}")
-        # Clean up partial file if present.
         await _remove_if_exists(path=target_path)
         return None, "timeout"
     except aiohttp.ClientError as e:
-        logger.error(f"Direct download network error: {e}")
+        # Log type only; aiohttp error messages can contain request URL.
+        logger.error(f"Direct download network error: {type(e).__name__}")
         await _remove_if_exists(path=target_path)
-        return None, f"network_error: {e}"
+        return None, "technical_error"
     except Exception as e:
-        logger.error(f"Direct download unexpected error: {e}")
+        logger.error(f"Direct download unexpected error: {type(e).__name__}")
         await _remove_if_exists(path=target_path)
-        return None, f"unexpected: {e}"
+        return None, "technical_error"
 
 
 async def _remove_if_exists(path: Path) -> None:

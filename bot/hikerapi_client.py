@@ -16,8 +16,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-HIKERAPI_BASE_URL = "https://api.hikerapi.com"
-HIKERAPI_MEDIA_BY_URL = "/v1/media/by/url"
+HIKERAPI_MEDIA_BY_URL = "https://api.hikerapi.com/v1/media/by/url"
 HIKERAPI_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
@@ -26,21 +25,16 @@ class HikerAPIClient:
 
     The client never raises on network/HTTP errors — failures are logged and
     returned as ``(None, error_msg)`` tuples so the handler layer can decide
-    how to report them to the user. This mirrors :func:`bot.downloader.download_video`.
-
-    The underlying :class:`aiohttp.ClientSession` is owned by the caller
-    (created in the bot's startup hook, closed in shutdown). We do **not** own
-    or close it here.
+    how to report them to the user. Error codes are stable identifiers
+    (``not_found``, ``rate_limited``, …), never raw exception strings — those
+    can carry URLs/headers and must not leak to users or stats.
     """
 
     def __init__(self, session: aiohttp.ClientSession, api_key: str) -> None:
         """Initialise the client with a pre-created session and API key.
 
         :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
-        :type session: aiohttp.ClientSession
         :param api_key: HikerAPI access key (sent as ``x-access-key`` header).
-        :type api_key: str
-        :return: None
         """
         self._session: aiohttp.ClientSession = session
         self._api_key: str = api_key
@@ -51,30 +45,24 @@ class HikerAPIClient:
     ) -> tuple[Optional[str], Optional[str]]:
         """Resolve an Instagram reel/post URL to a direct mp4 CDN URL.
 
-        :param instagram_url: Public Instagram reel/post URL (``/reel/…``,
-            ``/p/…``, ``/tv/…``).
-        :type instagram_url: str
-        :return: ``(mp4_url, error_msg)``. On success ``error_msg is None``;
-            on any failure ``mp4_url is None`` and ``error_msg`` is a short
-            human-readable string suitable for further classification.
-        :rtype: tuple[Optional[str], Optional[str]]
+        :param instagram_url: Public Instagram reel/post URL.
+        :return: ``(mp4_url, error_code)``. On success ``error_code is None``;
+            on failure ``mp4_url is None`` and ``error_code`` is one of the
+            stable tokens defined in the module docstring.
         """
-        request_url = f"{HIKERAPI_BASE_URL}{HIKERAPI_MEDIA_BY_URL}"
         headers = {
             "accept": "application/json",
             "x-access-key": self._api_key,
         }
         params = {"url": instagram_url}
 
-        logger.debug(
-            f"HikerAPI request: GET {HIKERAPI_MEDIA_BY_URL}?url={instagram_url}"
-        )
+        logger.debug(f"HikerAPI request: GET /v1/media/by/url?url={instagram_url}")
 
         timeout = aiohttp.ClientTimeout(total=HIKERAPI_REQUEST_TIMEOUT_SECONDS)
 
         try:
             async with self._session.get(
-                url=request_url,
+                url=HIKERAPI_MEDIA_BY_URL,
                 headers=headers,
                 params=params,
                 timeout=timeout,
@@ -84,14 +72,10 @@ class HikerAPIClient:
                     payload = await response.json()
                     return self._extract_video_url(payload=payload)
 
-                # Log response body for non-2xx to aid debugging, but only at
-                # ERROR level without the API key (never in headers dump).
-                body_text = await response.text()
-                # Trim overly long bodies to keep logs readable.
-                body_preview = body_text[:500]
-                logger.error(
-                    f"HikerAPI non-200 response: status={status}, body={body_preview!r}"
-                )
+                # Don't log the response body: HikerAPI errors can echo
+                # request-derived data, and a malicious/misconfigured upstream
+                # could reflect auth headers back into the body.
+                logger.error(f"HikerAPI non-200 response: status={status}")
 
                 if status == 404:
                     return None, "not_found"
@@ -101,23 +85,19 @@ class HikerAPIClient:
                     return None, "payment_required"
                 if status == 401 or status == 403:
                     return None, "unauthorized"
-                return None, f"http_{status}"
+                return None, "technical_error"
 
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"HikerAPI client response error: {e}")
-            return None, f"client_error: {e}"
-        except aiohttp.ClientError as e:
-            logger.error(f"HikerAPI network error: {e}")
-            return None, f"network_error: {e}"
         except TimeoutError:
-            logger.error(
-                f"HikerAPI timeout after {HIKERAPI_REQUEST_TIMEOUT_SECONDS}s: "
-                f"{instagram_url}"
-            )
+            logger.error(f"HikerAPI timeout after {HIKERAPI_REQUEST_TIMEOUT_SECONDS}s")
             return None, "timeout"
+        except aiohttp.ClientError as e:
+            # Log type only — aiohttp error messages can contain the request
+            # URL and, in rare redirect/reflect scenarios, headers.
+            logger.error(f"HikerAPI network error: {type(e).__name__}")
+            return None, "technical_error"
         except Exception as e:
-            logger.error(f"HikerAPI unexpected error: {e}")
-            return None, f"unexpected: {e}"
+            logger.error(f"HikerAPI unexpected error: {type(e).__name__}")
+            return None, "technical_error"
 
     def _extract_video_url(
         self,
@@ -125,21 +105,17 @@ class HikerAPIClient:
     ) -> tuple[Optional[str], Optional[str]]:
         """Pull the direct mp4 URL out of a HikerAPI ``Media`` JSON payload.
 
-        The v1 endpoint returns a flat object with ``video_url`` at the top
-        level for single videos (reels and video posts). For carousels
-        (``media_type == 8``) the top-level ``video_url`` is absent and the
-        video lives inside ``resources[i].video_url``; we pick the first
-        video resource in that case.
+        For single videos (reels, video posts) the v1 endpoint returns a flat
+        object with ``video_url`` at the top level. Carousels aren't handled
+        here — per the plan we skip them.
 
         :param payload: Parsed JSON response from HikerAPI.
-        :type payload: object
-        :return: ``(mp4_url, None)`` on success, ``(None, error_msg)`` when
+        :return: ``(mp4_url, None)`` on success, ``(None, error_code)`` when
             the payload has no usable video URL.
-        :rtype: tuple[Optional[str], Optional[str]]
         """
         if not isinstance(payload, dict):
             logger.error(f"HikerAPI unexpected payload type: {type(payload).__name__}")
-            return None, "unexpected_payload"
+            return None, "technical_error"
 
         media_code = payload.get("code")
         media_type = payload.get("media_type")
@@ -152,21 +128,6 @@ class HikerAPIClient:
                 f"product_type={product_type} video_url=<present>"
             )
             return video_url, None
-
-        # Carousel — pick the first video resource.
-        resources = payload.get("resources")
-        if isinstance(resources, list):
-            for resource in resources:
-                if not isinstance(resource, dict):
-                    continue
-                resource_video_url = resource.get("video_url")
-                if isinstance(resource_video_url, str) and resource_video_url != "":
-                    logger.info(
-                        f"HikerAPI ok (carousel): code={media_code} "
-                        f"media_type={media_type} product_type={product_type} "
-                        f"video_url=<present>"
-                    )
-                    return resource_video_url, None
 
         logger.warning(
             f"HikerAPI response has no video_url: code={media_code} "
