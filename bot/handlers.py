@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
@@ -22,10 +23,12 @@ from bot.downloader import (
     can_bot_delete_messages,
     cleanup_file,
     cleanup_info_json,
+    download_direct_url,
     download_video,
     extract_video_description,
     get_video_dimensions,
 )
+from bot.hikerapi_client import HikerAPIClient
 from bot.stats import GoogleSheetsStats
 
 logger = logging.getLogger(__name__)
@@ -159,8 +162,15 @@ async def handle_message(
     bot: Bot,
     config: Config,
     stats_tracker: GoogleSheetsStats,
+    hikerapi_client: Optional[HikerAPIClient],
+    http_session: aiohttp.ClientSession,
 ) -> None:
     """Handle plain text messages, extract Instagram/TikTok URLs, send videos.
+
+    Instagram URLs are resolved through :class:`HikerAPIClient` (Meta CDN
+    direct mp4 URL) and downloaded via :func:`download_direct_url`. TikTok
+    URLs keep the original ``yt-dlp`` path through :func:`download_video`,
+    since yt-dlp + proxy works for TikTok in our deployment environment.
 
     :param message: Incoming message.
     :type message: Message
@@ -170,6 +180,12 @@ async def handle_message(
     :type config: Config
     :param stats_tracker: Google Sheets stats client injected by the dispatcher.
     :type stats_tracker: GoogleSheetsStats
+    :param hikerapi_client: HikerAPI client injected by the dispatcher; may be
+        ``None`` when ``HIKERAPI_KEY`` is unset — in that case Instagram URLs
+        get a configuration-error message back.
+    :type hikerapi_client: Optional[HikerAPIClient]
+    :param http_session: Shared aiohttp session for direct CDN downloads.
+    :type http_session: aiohttp.ClientSession
     :return: None
     """
     if message.text is None:
@@ -180,23 +196,15 @@ async def handle_message(
     instagram_match = INSTAGRAM_REELS_PATTERN.search(message.text)
     tiktok_match = TIKTOK_PATTERN.search(message.text)
 
-    if instagram_match is None and tiktok_match is None:
-        return
-
-    video_url: Optional[str] = None
-    platform: Optional[str] = None
-    use_proxy = False
-
+    video_url: str
+    platform: str
     if instagram_match is not None:
         video_url = instagram_match.group(0)
         platform = "Instagram"
-        use_proxy = False
     elif tiktok_match is not None:
         video_url = tiktok_match.group(0)
         platform = "TikTok"
-        use_proxy = True  # TikTok requires a proxy in most regions
-
-    if video_url is None or platform is None:
+    else:
         return
 
     logger.info(f"Detected {platform} URL: {video_url}")
@@ -212,78 +220,36 @@ async def handle_message(
 
     video_path: Optional[Path] = None
     try:
-        video_path, error_msg = await download_video(
-            url=video_url,
-            temp_dir=config.temp_dir,
-            proxy_url=config.proxy_url,
-            use_proxy=use_proxy,
-        )
+        if platform == "Instagram":
+            video_path, error_code = await _download_instagram(
+                instagram_url=video_url,
+                temp_dir=config.temp_dir,
+                hikerapi_client=hikerapi_client,
+                http_session=http_session,
+                status_message=status_message,
+            )
+            error_detail = _instagram_error_detail(error_code=error_code)
+        else:
+            video_path, yt_dlp_error = await download_video(
+                url=video_url,
+                temp_dir=config.temp_dir,
+                proxy_url=config.proxy_url,
+                use_proxy=True,
+            )
+            error_detail = _tiktok_error_detail(error_msg=yt_dlp_error)
+            # Keep the raw yt-dlp stderr for stats only; don't show it to users.
+            error_code = yt_dlp_error
 
         if video_path is None:
             logger.error(
                 f"Failed to download video from {platform}. "
-                f"URL: {video_url}. Error: {error_msg}"
+                f"URL: {video_url}. Error: {error_code}"
             )
-
-            error_text = "❌ Не удалось скачать видео."
-
-            if error_msg is not None:
-                error_msg_lower = error_msg.lower()
-
-                if (
-                    "this content may be inappropriate" in error_msg_lower
-                    or "inappropriate" in error_msg_lower
-                ):
-                    error_text += (
-                        "\n\n💬 Видео может содержать контент для взрослых или "
-                        "материалы, которые требуют входа в аккаунт для просмотра."
-                    )
-                    logger.info(f"Inappropriate content error for URL: {video_url}")
-                elif "private" in error_msg_lower or "приватн" in error_msg_lower:
-                    error_text += (
-                        "\n\n🔒 Видео является приватным и недоступно для скачивания."
-                    )
-                    logger.info(f"Private content error for URL: {video_url}")
-                elif "not available" in error_msg_lower or "unavailable" in error_msg_lower:
-                    error_text += (
-                        "\n\n🚫 Видео недоступно. Возможно, оно было удалено или скрыто автором."
-                    )
-                    logger.info(f"Content not available for URL: {video_url}")
-                elif "age" in error_msg_lower and "restrict" in error_msg_lower:
-                    error_text += (
-                        "\n\n🔞 Видео имеет возрастные ограничения и требует входа в аккаунт."
-                    )
-                    logger.info(f"Age-restricted content for URL: {video_url}")
-                elif "login" in error_msg_lower or "sign in" in error_msg_lower:
-                    error_text += (
-                        "\n\n🔑 Для скачивания этого видео требуется авторизация в аккаунте."
-                    )
-                    logger.info(f"Login required for URL: {video_url}")
-                elif (
-                    "geo" in error_msg_lower
-                    or "region" in error_msg_lower
-                    or "country" in error_msg_lower
-                ):
-                    error_text += (
-                        "\n\n🌍 Видео недоступно в вашем регионе из-за географических ограничений."
-                    )
-                    logger.info(f"Geo-restricted content for URL: {video_url}")
-                elif (
-                    "429" in error_msg
-                    or "rate limit" in error_msg_lower
-                    or "too many requests" in error_msg_lower
-                ):
-                    error_text += (
-                        "\n\n⏱️ Слишком много запросов. Пожалуйста, попробуйте позже."
-                    )
-                    logger.info(f"Rate limit error for URL: {video_url}")
-                else:
-                    error_text += f"\n\n⚠️ Техническая информация:\n{error_msg}"
-                    logger.warning(f"Unknown error type for URL: {video_url}")
-            else:
-                error_text += "\n\n❓ Возможно, контент недоступен или является приватным."
-                logger.warning(f"No error message provided for failed download: {video_url}")
-
+            error_text = (
+                error_detail
+                if error_detail is not None
+                else ("❌ Не удалось скачать видео.")
+            )
             await status_message.edit_text(text=error_text)
 
             asyncio.create_task(
@@ -292,7 +258,7 @@ async def handle_message(
                     chat_id=message.chat.id,
                     platform=platform,
                     url=video_url,
-                    error_msg=error_msg or "Unknown error",
+                    error_msg=_safe_stats_error(error_code=error_code),
                 )
             )
             return
@@ -349,7 +315,170 @@ async def handle_message(
 
     except Exception as e:
         logger.error(f"Error handling message: {e}")
-        await status_message.edit_text(text="❌ Произошла ошибка при обработке запроса.")
+        await status_message.edit_text(
+            text="❌ Произошла ошибка при обработке запроса."
+        )
         if video_path is not None:
             await cleanup_info_json(video_path=video_path)
             await cleanup_file(file_path=video_path)
+
+
+async def _download_instagram(
+    instagram_url: str,
+    temp_dir: Path,
+    hikerapi_client: Optional[HikerAPIClient],
+    http_session: aiohttp.ClientSession,
+    status_message: Message,
+) -> tuple[Optional[Path], Optional[str]]:
+    """Resolve an Instagram URL via HikerAPI, then stream the mp4 from CDN.
+
+    Updates ``status_message`` between the two stages so the user isn't
+    staring at "Скачиваю видео..." for up to 90 seconds in the worst case.
+
+    :param instagram_url: Instagram reel/post URL matched by the handler.
+    :param temp_dir: Directory to place downloaded files in.
+    :param hikerapi_client: Configured client, or ``None`` when the key is
+        not set.
+    :param http_session: Shared aiohttp session for the CDN GET.
+    :param status_message: Reply message we're editing for progress updates.
+    :return: ``(path_to_video, error_code)``. ``error_code`` is a stable
+        token from :mod:`bot.hikerapi_client` or :func:`download_direct_url`,
+        never a raw exception string.
+    """
+    if hikerapi_client is None:
+        return None, "hikerapi_key_missing"
+
+    direct_url, error_code = await hikerapi_client.get_reel_media_url(
+        instagram_url=instagram_url,
+    )
+    if direct_url is None:
+        return None, error_code
+
+    # Stage transition: user sees something happened without us sending a
+    # second message (edit_text is free of rate-limit concerns for a single
+    # chat and keeps the UI compact).
+    try:
+        await status_message.edit_text(text="⬇️ Загружаю видео...")
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        logger.debug(f"Could not update status message: {e}")
+
+    return await download_direct_url(
+        direct_url=direct_url,
+        temp_dir=temp_dir,
+        session=http_session,
+    )
+
+
+def _instagram_error_detail(error_code: Optional[str]) -> Optional[str]:
+    """Map an Instagram-path error code to a user-facing message.
+
+    Covers codes emitted by :mod:`bot.hikerapi_client` and
+    :func:`download_direct_url`. Anything unknown falls through to a generic
+    "technical error" message — raw exception strings must never reach users.
+
+    :param error_code: Stable error token, or ``None``.
+    :return: User-facing message, or ``None`` to signal "use the default".
+    """
+    if error_code is None:
+        return None
+    table: dict[str, str] = {
+        "hikerapi_key_missing": (
+            "⚙️ Instagram временно не обслуживается: не задан HIKERAPI_KEY. "
+            "Сообщите администратору."
+        ),
+        "not_found": "❌ Не удалось скачать видео.\n\n🚫 Пост недоступен или был удалён.",
+        "rate_limited": (
+            "❌ Не удалось скачать видео.\n\n"
+            "⏱️ Сервис временно перегружен, попробуйте через минуту."
+        ),
+        "payment_required": (
+            "❌ Не удалось скачать видео.\n\n"
+            "💳 Временные проблемы с сервисом, сообщите администратору."
+        ),
+        "unauthorized": (
+            "❌ Не удалось скачать видео.\n\n"
+            "🔑 Сервис отклонил авторизацию, сообщите администратору."
+        ),
+        "no_video_url": "❌ Не удалось скачать видео.\n\n🖼️ В посте нет видео для скачивания.",
+        "timeout": (
+            "❌ Не удалось скачать видео.\n\n"
+            "⏳ Не удалось получить видео, попробуйте позже."
+        ),
+        "disallowed_host": (
+            "❌ Не удалось скачать видео.\n\n"
+            "⚠️ Технический сбой, сообщите администратору."
+        ),
+        "forbidden": "❌ Не удалось скачать видео.\n\n🚫 Видео недоступно для скачивания.",
+        "file_too_large": (
+            "❌ Не удалось скачать видео.\n\n"
+            "📦 Видео слишком большое для Telegram (>50 МБ)."
+        ),
+        "technical_error": "❌ Не удалось скачать видео.\n\n⚠️ Технический сбой, попробуйте позже.",
+    }
+    return table.get(
+        error_code,
+        "❌ Не удалось скачать видео.\n\n⚠️ Технический сбой, попробуйте позже.",
+    )
+
+
+def _tiktok_error_detail(error_msg: Optional[str]) -> Optional[str]:
+    """Classify a yt-dlp stderr string for TikTok into a user-facing message.
+
+    yt-dlp returns free-form stderr; we only pattern-match on enough markers
+    to give the user a meaningful hint, and fall through to a generic message
+    otherwise. Raw stderr is **never** shown to the user — it may contain
+    proxy URLs or full video IDs.
+
+    :param error_msg: yt-dlp stderr text, or ``None``.
+    :return: User-facing message, or ``None`` when nothing's available.
+    """
+    if error_msg is None:
+        return "❌ Не удалось скачать видео.\n\n❓ Возможно, контент недоступен или является приватным."
+
+    lower = error_msg.lower()
+    if "private" in lower or "приватн" in lower:
+        return "❌ Не удалось скачать видео.\n\n🔒 Видео является приватным и недоступно для скачивания."
+    if "not available" in lower or "unavailable" in lower:
+        return "❌ Не удалось скачать видео.\n\n🚫 Видео недоступно. Возможно, оно было удалено или скрыто автором."
+    if "age" in lower and "restrict" in lower:
+        return "❌ Не удалось скачать видео.\n\n🔞 Видео имеет возрастные ограничения и требует входа в аккаунт."
+    if "login" in lower or "sign in" in lower:
+        return "❌ Не удалось скачать видео.\n\n🔑 Для скачивания этого видео требуется авторизация в аккаунте."
+    if "geo" in lower or "region" in lower or "country" in lower:
+        return "❌ Не удалось скачать видео.\n\n🌍 Видео недоступно в вашем регионе из-за географических ограничений."
+    if "429" in error_msg or "rate limit" in lower or "too many requests" in lower:
+        return "❌ Не удалось скачать видео.\n\n⏱️ Слишком много запросов. Пожалуйста, попробуйте позже."
+    return "❌ Не удалось скачать видео.\n\n⚠️ Технический сбой, попробуйте позже."
+
+
+# Allowlist of stable error codes we accept into stats. Anything not on this
+# list (raw exception strings, yt-dlp stderr, unknown tokens) becomes
+# ``"other"`` — stats must not become a dumping ground for traceback strings.
+_SAFE_STATS_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "hikerapi_key_missing",
+        "not_found",
+        "rate_limited",
+        "payment_required",
+        "unauthorized",
+        "no_video_url",
+        "timeout",
+        "disallowed_host",
+        "forbidden",
+        "file_too_large",
+        "technical_error",
+    }
+)
+
+
+def _safe_stats_error(error_code: Optional[str]) -> str:
+    """Return a stats-safe error label.
+
+    :param error_code: Error token; yt-dlp stderr or raw exception string.
+    :return: ``error_code`` if it's a known stable token, else ``"other"``.
+    """
+    if error_code is None:
+        return "unknown"
+    if error_code in _SAFE_STATS_ERROR_CODES:
+        return error_code
+    return "other"
