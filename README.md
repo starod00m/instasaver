@@ -181,6 +181,29 @@ uv run yt-dlp --list-impersonate-targets
 `WEBHOOK_URL` через `getWebhookInfo` — повторных вызовов при рестартах
 контейнера не происходит.
 
+#### Деплой на st-dad: сборка на сервере вместо `docker pull`
+
+На домашнем сервере `st-dad` исходящий трафик идёт через VPN, exit-нода
+которого throttlит **GitHub-инфраструктуру** (`ghcr.io`,
+`*.githubusercontent.com`, `github.com`) **и** `deb.debian.org` до ~45 КБ/с.
+Из-за этого штатный `docker compose pull` образа с GHCR (~1.3 ГБ) зависает.
+
+Docker Hub, PyPI/Fastly и `cloudfront.debian.net` (официальный CDN Debian)
+**не** throttlятся, поэтому образ собирается прямо на сервере — pull готового
+образа с GHCR при этом не нужен. Мелкий `git clone --depth 1` проскакивает
+throttle. Всё это автоматизирует [`scripts/deploy.sh`](scripts/deploy.sh):
+
+```bash
+./scripts/deploy.sh          # задеплоить main
+./scripts/deploy.sh <ref>    # ветку/тег/sha
+```
+
+Скрипт по SSH: клонирует свежий код на сервер → собирает образ
+(`--build-arg APT_MIRROR=http://cloudfront.debian.net`, минуя throttled
+`deb.debian.org`) → прописывает свежий тег в `compose.yml` → `docker compose
+up -d` → дожидается healthcheck. Ручной `docker save`/`load` по LAN больше не
+нужен.
+
 ### Режим 2: Локальный запуск для отладки
 
 Полная процедура с граблями и разборкой — в
