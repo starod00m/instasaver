@@ -78,13 +78,6 @@ class Config:
             _get_optional(name="ADMIN_USER_ID", default="") or None
         )
 
-        # HikerAPI key для скачивания Instagram-видео. Если не задан, Instagram-
-        # ссылки обрабатываться не будут (см. bot/handlers.py). Бот всё равно
-        # запускается — TikTok через yt-dlp остаётся работоспособным.
-        self.hikerapi_key: Optional[str] = (
-            _get_optional(name="HIKERAPI_KEY", default="") or None
-        )
-
         self.google_credentials_json_base64: Optional[str] = (
             _get_optional(name="GOOGLE_CREDENTIALS_JSON_BASE64", default="") or None
         )

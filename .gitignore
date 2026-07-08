@@ -32,3 +32,5 @@ temp/
 *.egg-info/
 dist/
 build/
+
+.review/

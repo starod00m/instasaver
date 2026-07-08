@@ -11,11 +11,9 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 import aiofiles
 import aiofiles.os
-import aiohttp
 from aiogram import Bot
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -23,17 +21,28 @@ from aiogram.types import ChatMemberAdministrator, Message
 
 logger = logging.getLogger(__name__)
 
-# Hosts we accept as sources for direct CDN downloads. HikerAPI should only
-# ever hand us URLs on Meta's CDN; anything else (metadata endpoints, internal
-# hosts, file://) must be refused without a request being made. We match on
-# suffix to cover *.cdninstagram.com, *.fbcdn.net, scontent-*.fbcdn.net etc.
-_ALLOWED_DIRECT_URL_HOST_SUFFIXES: tuple[str, ...] = (
-    ".cdninstagram.com",
-    ".fbcdn.net",
-)
-# Hard cap on mp4 size. Telegram Bot API refuses files >50 MiB for bots; even
-# without that, an unbounded download would let an attacker fill tmpfs.
-_DIRECT_DOWNLOAD_MAX_BYTES: int = 50 * 1024 * 1024
+
+def _is_ytdlp_artifact(path: Path) -> bool:
+    """Return True if ``path`` is a yt-dlp helper/partial artifact, not a
+    finished media file.
+
+    yt-dlp leaves ``.part`` / ``.ytdl`` files (and fragment partials such as
+    ``.part-Frag0``) on interrupted or fragmented downloads, plus the
+    ``.info.json`` metadata file. ``download_id`` is shared across retries, so
+    a stale partial must not be mistaken for a finished video nor mask the
+    ``file_too_large`` branch.
+
+    :param path: Candidate file produced under ``temp_dir``.
+    :type path: Path
+    :return: ``True`` for yt-dlp artifacts, ``False`` for real media files.
+    :rtype: bool
+    """
+    suffix = path.suffix
+    return (
+        suffix == ".json"
+        or suffix.startswith(".part")
+        or suffix.startswith(".ytdl")
+    )
 
 
 async def get_video_dimensions(video_path: Path) -> tuple[int, int]:
@@ -105,7 +114,10 @@ async def download_video(
     :param max_retries: Maximum number of attempts.
     :type max_retries: int
     :return: Tuple of ``(path_to_video, error_msg)``. On success the second
-        element is ``None``; on failure the first element is ``None``.
+        element is ``None``; on failure the first element is ``None``. When
+        the video exceeds ``--max-filesize`` (50M), yt-dlp aborts silently
+        with exit code 0 and no video file, and ``error_msg`` is the literal
+        marker ``"file_too_large"`` (not retried).
     :rtype: tuple[Optional[Path], Optional[str]]
     """
     rate_limits = ["8M", "4M", "2M", "1M"]
@@ -134,12 +146,26 @@ async def download_video(
                 "--quiet",
                 "--no-warnings",
                 "--format",
-                "best",
+                # Prefer a format that already fits Telegram's 50 MB limit
+                # (exact size first, then approximate — many IG/TikTok
+                # formats only declare filesize_approx) so a smaller
+                # rendition (e.g. 720p) is chosen over the best one when the
+                # best one wouldn't fit. Falls back to plain "best" when no
+                # format declares a size at all; --max-filesize below still
+                # guards that case.
+                "best[filesize<=50M]/best[filesize_approx<=50M]/best",
+                # Mirrors the Telegram Bot API's 50 MB upload limit so yt-dlp
+                # refuses to download a file we couldn't send anyway,
+                # protecting the tmpfs-backed temp_dir from oversized files.
+                "--max-filesize",
+                "50M",
                 "--limit-rate",
                 current_rate_limit,
                 "--output",
                 output_template,
                 "--write-info-json",
+                # Read-only rootfs: no writable cache directory is guaranteed.
+                "--no-cache-dir",
             ]
 
             if use_proxy and proxy_url is not None:
@@ -197,10 +223,26 @@ async def download_video(
 
                 return None, error_msg
 
-            files = [
-                p for p in temp_dir.glob(f"{download_id}_*") if p.suffix != ".json"
-            ]
+            all_files = list(temp_dir.glob(f"{download_id}_*"))
+            files = [p for p in all_files if not _is_ytdlp_artifact(path=p)]
             if not files:
+                # yt-dlp aborts silently (exit code 0, --quiet swallows the
+                # "Aborting" message) when --max-filesize is exceeded. It
+                # still writes the info JSON before attempting the media
+                # download, so a leftover info.json with no video file is
+                # the only signal we have that this was a size rejection
+                # rather than a real download failure. Retrying is useless
+                # here since the file won't get smaller.
+                info_jsons = [p for p in all_files if p.name.endswith(".info.json")]
+                if info_jsons:
+                    logger.warning(
+                        f"yt-dlp aborted: file exceeds --max-filesize "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    for info_json in info_jsons:
+                        info_json.unlink(missing_ok=True)
+                    return None, "file_too_large"
+
                 error_msg = "No file was downloaded"
                 last_error_msg = error_msg
                 if attempt < max_retries - 1:
@@ -223,159 +265,6 @@ async def download_video(
                 continue
 
     return None, last_error_msg or "Download failed after all retry attempts"
-
-
-def _is_allowed_direct_url(direct_url: str) -> bool:
-    """Return True if ``direct_url`` is safe to fetch from the bot process.
-
-    Enforces: scheme ``https://``, host ending in one of the Meta CDN
-    suffixes. Anything else (``http://169.254.169.254``, ``file://``,
-    ``localhost``) is refused — HikerAPI is an external dependency and its
-    response must not be allowed to SSRF the deployment host.
-
-    :param direct_url: URL string returned by HikerAPI.
-    :return: True iff the URL passes the allowlist.
-    """
-    try:
-        parsed = urlparse(direct_url)
-    except Exception:
-        return False
-    if parsed.scheme != "https":
-        return False
-    host = parsed.hostname
-    if host is None:
-        return False
-    host = host.lower()
-    return any(
-        host == s[1:] or host.endswith(s) for s in _ALLOWED_DIRECT_URL_HOST_SUFFIXES
-    )
-
-
-async def download_direct_url(
-    direct_url: str,
-    temp_dir: Path,
-    session: aiohttp.ClientSession,
-) -> tuple[Optional[Path], Optional[str]]:
-    """Download an mp4 file directly from a Meta CDN URL, streaming into a file.
-
-    Intended for URLs resolved through HikerAPI (see
-    :class:`bot.hikerapi_client.HikerAPIClient`). Does **not** use yt-dlp.
-
-    Enforces an SSRF allowlist (``*.cdninstagram.com`` / ``*.fbcdn.net``, https
-    only), caps total size at 50 MiB, and retries once on a 403 (CDN cookies
-    for HikerAPI's account can briefly go stale between resolve and fetch).
-
-    :param direct_url: Fully-qualified CDN URL of the mp4 to download.
-    :param temp_dir: Directory to place the downloaded file in.
-    :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
-    :return: ``(path_to_video, error_code)``. On success ``error_code`` is
-        ``None``; on failure ``path_to_video`` is ``None`` and ``error_code``
-        is one of ``disallowed_host``, ``forbidden``, ``file_too_large``,
-        ``timeout``, ``technical_error``.
-    """
-    if not _is_allowed_direct_url(direct_url=direct_url):
-        parsed_host = urlparse(direct_url).hostname or "<unparseable>"
-        logger.error(f"Direct download refused: host not on allowlist: {parsed_host}")
-        return None, "disallowed_host"
-
-    # One retry on 403: mirrors the ТЗ edge case where HikerAPI's CDN cookie
-    # briefly expires between URL resolution and the actual GET. Anything else
-    # is a terminal error.
-    max_attempts = 2
-    last_error: Optional[str] = None
-    for attempt in range(max_attempts):
-        path, error_code = await _attempt_direct_download(
-            direct_url=direct_url,
-            temp_dir=temp_dir,
-            session=session,
-        )
-        if path is not None:
-            return path, None
-        last_error = error_code
-        if error_code == "forbidden" and attempt + 1 < max_attempts:
-            logger.warning(
-                f"Direct download got 403, retrying once (attempt {attempt + 2}/{max_attempts})"
-            )
-            await asyncio.sleep(1)
-            continue
-        break
-    return None, last_error
-
-
-async def _attempt_direct_download(
-    direct_url: str,
-    temp_dir: Path,
-    session: aiohttp.ClientSession,
-) -> tuple[Optional[Path], Optional[str]]:
-    """Single-shot chunked mp4 download with size cap. Internal helper.
-
-    :param direct_url: Pre-validated CDN URL.
-    :param temp_dir: Directory to place the downloaded file in.
-    :param session: Shared ``aiohttp.ClientSession`` owned by the caller.
-    :return: ``(path, None)`` on success; ``(None, error_code)`` on any
-        failure, with the partial file cleaned up.
-    """
-    download_id = str(uuid.uuid4())[:8]
-    target_path = temp_dir / f"{download_id}_hikerapi.mp4"
-    timeout = aiohttp.ClientTimeout(total=60)
-    chunk_size = 1024 * 1024
-
-    try:
-        async with session.get(url=direct_url, timeout=timeout) as response:
-            status = response.status
-            if status != 200:
-                logger.error(f"Direct download HTTP {status} for {target_path.name}")
-                if status == 403:
-                    return None, "forbidden"
-                return None, "technical_error"
-
-            total_bytes = 0
-            async with aiofiles.open(target_path, mode="wb") as f:
-                async for chunk in response.content.iter_chunked(n=chunk_size):
-                    total_bytes += len(chunk)
-                    if total_bytes > _DIRECT_DOWNLOAD_MAX_BYTES:
-                        logger.error(
-                            f"Direct download exceeded {_DIRECT_DOWNLOAD_MAX_BYTES} B, aborting"
-                        )
-                        # Abort the chunked read. The response context manager
-                        # releases the connection; partial file is cleaned below.
-                        await _remove_if_exists(path=target_path)
-                        return None, "file_too_large"
-                    await f.write(chunk)
-
-            logger.info(
-                f"Direct download finished: {target_path.name} "
-                f"({total_bytes // 1024} KB)"
-            )
-            return target_path, None
-
-    except TimeoutError:
-        logger.error(f"Direct download timeout for {target_path.name}")
-        await _remove_if_exists(path=target_path)
-        return None, "timeout"
-    except aiohttp.ClientError as e:
-        # Log type only; aiohttp error messages can contain request URL.
-        logger.error(f"Direct download network error: {type(e).__name__}")
-        await _remove_if_exists(path=target_path)
-        return None, "technical_error"
-    except Exception as e:
-        logger.error(f"Direct download unexpected error: {type(e).__name__}")
-        await _remove_if_exists(path=target_path)
-        return None, "technical_error"
-
-
-async def _remove_if_exists(path: Path) -> None:
-    """Remove a file if it exists, swallowing errors.
-
-    :param path: Path to the file to delete.
-    :type path: Path
-    :return: None
-    """
-    try:
-        if await aiofiles.os.path.exists(path):
-            await aiofiles.os.remove(path)
-    except Exception as e:
-        logger.warning(f"Could not remove partial file {path.name}: {e}")
 
 
 async def cleanup_file(file_path: Path) -> None:
