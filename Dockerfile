@@ -23,7 +23,8 @@ FROM python:3.13-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/app/.venv/bin:$PATH"
+    PATH="/app/.venv/bin:$PATH" \
+    HOME=/tmp
 
 # Non-root user (UID 10001 per ops runbook).
 RUN groupadd -r appuser && useradd -r -g appuser -u 10001 appuser \
