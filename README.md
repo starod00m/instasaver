@@ -181,9 +181,9 @@ uv run yt-dlp --list-impersonate-targets
 `WEBHOOK_URL` через `getWebhookInfo` — повторных вызовов при рестартах
 контейнера не происходит.
 
-#### Деплой на st-dad: сборка на сервере вместо `docker pull`
+#### Деплой на сервер: сборка на сервере вместо `docker pull`
 
-На домашнем сервере `st-dad` исходящий трафик идёт через VPN, exit-нода
+На домашнем сервере исходящий трафик идёт через VPN, exit-нода
 которого throttlит **GitHub-инфраструктуру** (`ghcr.io`,
 `*.githubusercontent.com`, `github.com`) **и** `deb.debian.org` до ~45 КБ/с.
 Из-за этого штатный `docker compose pull` образа с GHCR (~1.3 ГБ) зависает.
