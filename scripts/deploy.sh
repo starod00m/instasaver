@@ -1,28 +1,56 @@
 #!/usr/bin/env bash
-# Deploy instasaver to st-dad by building the image ON the server.
+# Deploy instasaver by building the image ON the target server.
 #
 # Why build on the server instead of `docker compose pull`?
 # The server's outbound traffic goes through a VPN whose exit node throttles
-# GitHub infrastructure (ghcr.io, github.com, *.githubusercontent.com) down to
-# ~40-55 KB/s, which makes pulling the ~1.3 GB image from GHCR hang. Docker Hub,
-# PyPI/Fastly and Debian mirrors are NOT throttled, so building the image
-# locally on the server works fine — it never pulls the finished image from GHCR.
+# GitHub infrastructure (ghcr.io, github.com, *.githubusercontent.com) and
+# deb.debian.org down to ~45 KB/s, which makes pulling the ~1.3 GB image from
+# GHCR hang. Docker Hub, PyPI/Fastly and cloudfront.debian.net are NOT
+# throttled, so building the image on the server works fine — it never pulls
+# the finished image from GHCR.
 #
 # A shallow `git clone` of the repo is small enough to slip past the throttle
 # (a few hundred KB), so we fetch source, build, then run.
 #
-# Usage:  ./scripts/deploy.sh            # deploy current main
-#         ./scripts/deploy.sh <ref>      # deploy a specific branch/tag/sha
+# Usage:  ./scripts/deploy.sh                 # deploy origin/main
+#         ./scripts/deploy.sh <ref>           # deploy a branch/tag/sha
+#         ./scripts/deploy.sh <ref> --force   # deploy a ref that is behind main
 #
-# Idempotent and safe to re-run. Requires SSH access to `st-dad`.
+# Safety: refuses to deploy a ref that does NOT contain origin/main's HEAD
+# (i.e. a ref that would roll production back). Override with --force.
+#
+# Idempotent and safe to re-run. Requires SSH access to the target host.
 set -euo pipefail
 
 SSH_HOST="${DEPLOY_SSH_HOST:-st-dad}"
 REPO_URL="${DEPLOY_REPO_URL:-https://github.com/starod00m/instasaver.git}"
 REF="${1:-main}"
+FORCE="${2:-}"
 IMAGE="ghcr.io/starod00m/instasaver"
 BUILD_DIR="/tmp/instasaver-build"
 PROD_DIR="/srv/bots/instasaver"
+
+# --- Guard: don't silently roll production back ---------------------------
+# The ref we deploy must contain origin/main's HEAD. Otherwise we'd build from
+# code older than main and quietly downgrade prod (which is exactly how a
+# previous deploy reverted an Instagram fix). Run from a clone that has an
+# `origin` remote; if we can't resolve refs locally, warn and continue.
+if git rev-parse --git-dir >/dev/null 2>&1; then
+    git fetch -q origin main 2>/dev/null || true
+    if git rev-parse -q --verify origin/main >/dev/null 2>&1 \
+       && git rev-parse -q --verify "${REF}" >/dev/null 2>&1; then
+        if ! git merge-base --is-ancestor origin/main "${REF}"; then
+            echo "!! Ref '${REF}' does NOT contain origin/main — deploying it would"
+            echo "!! roll production back. Rebase onto main, or pass --force to override."
+            [ "${FORCE}" = "--force" ] || exit 1
+            echo ">> --force given: deploying a ref behind main anyway."
+        fi
+    else
+        echo ">> (skipping ancestry check: origin/main or '${REF}' not found locally)"
+    fi
+else
+    echo ">> (not in a git repo: skipping ancestry check)"
+fi
 
 echo ">> Deploying instasaver (ref=${REF}) to ${SSH_HOST}"
 
@@ -46,8 +74,9 @@ else
 fi
 
 SHA="$(git -C "${BUILD_DIR}" rev-parse --short HEAD)"
+SUBJECT="$(git -C "${BUILD_DIR}" log -1 --pretty=%s)"
 TAG="${IMAGE}:sha-${SHA}"
-echo ">> [server] Building ${TAG}"
+echo ">> [server] Building ${TAG}  (${SUBJECT})"
 # deb.debian.org is throttled by the VPN exit; cloudfront.debian.net (the
 # official Debian CDN) is not, so point apt at it for the runtime-stage install.
 DOCKER_BUILDKIT=1 docker build \
@@ -73,7 +102,9 @@ for _ in $(seq 1 20); do
     sleep 3
 done
 if [ "${status}" != "healthy" ]; then
-    echo "!! container not healthy — showing logs"
+    echo "!! container not healthy — rolling back to previous compose"
+    mv -f compose.yml.bak compose.yml
+    docker compose up -d --no-build || true
     docker compose logs --tail 30
     exit 1
 fi
