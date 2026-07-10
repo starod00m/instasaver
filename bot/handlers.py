@@ -23,7 +23,6 @@ from bot.downloader import (
     cleanup_file,
     cleanup_info_json,
     download_video,
-    extract_video_description,
     get_video_dimensions,
 )
 from bot.stats import GoogleSheetsStats
@@ -250,13 +249,11 @@ async def handle_message(
             f"Video downloaded: {video_path.name} ({video_path.stat().st_size // 1024} KB)"
         )
 
-        # Both platforms go through yt-dlp with --write-info-json, so the caption
-        # is the video description extracted from the info JSON.
-        description = await extract_video_description(video_path=video_path)
-        if description is not None:
-            logger.debug(f"Description extracted: {len(description)} chars")
-        else:
-            logger.debug("Description: None")
+        # The caption is a mention of the user who triggered the download, so
+        # the author stays visible even after the original message is deleted.
+        # Falls back to no caption when the user has no public @username.
+        username = message.from_user.username
+        caption = f"@{username}" if username is not None else None
 
         width, height = await get_video_dimensions(video_path=video_path)
         logger.debug(f"Video dimensions: {width}x{height}")
@@ -268,7 +265,7 @@ async def handle_message(
                 video=video_file,
                 width=width if width > 0 else None,
                 height=height if height > 0 else None,
-                caption=description,
+                caption=caption,
             )
             await status_message.delete()
             try:
@@ -282,7 +279,7 @@ async def handle_message(
                 video=video_file,
                 width=width if width > 0 else None,
                 height=height if height > 0 else None,
-                caption=description,
+                caption=caption,
             )
             await status_message.delete()
 

@@ -6,13 +6,11 @@ report them to the user.
 """
 
 import asyncio
-import json
 import logging
 import uuid
 from pathlib import Path
 from typing import Optional
 
-import aiofiles
 import aiofiles.os
 from aiogram import Bot
 from aiogram.enums import ChatType
@@ -163,6 +161,9 @@ async def download_video(
                 current_rate_limit,
                 "--output",
                 output_template,
+                # Written before the media download, so a leftover .info.json
+                # with no video file is our only signal that yt-dlp aborted on
+                # --max-filesize (the file_too_large branch below relies on it).
                 "--write-info-json",
                 # Read-only rootfs: no writable cache directory is guaranteed.
                 "--no-cache-dir",
@@ -279,45 +280,6 @@ async def cleanup_file(file_path: Path) -> None:
         logger.info(f"Cleaned up: {file_path.name}")
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
-
-
-async def extract_video_description(video_path: Path) -> Optional[str]:
-    """Extract the video description from the yt-dlp info JSON file.
-
-    Reads the ``<stem>.info.json`` file produced by yt-dlp's
-    ``--write-info-json`` flag. Never raises — returns ``None`` on any error
-    so sending the video is not blocked.
-
-    :param video_path: Path to the downloaded video file.
-    :type video_path: Path
-    :return: Description string (truncated to 1024 chars) or ``None``.
-    :rtype: Optional[str]
-    """
-    try:
-        info_path = video_path.with_suffix(".info.json")
-        if not await aiofiles.os.path.exists(info_path):
-            logger.debug(f"Info JSON not found: {info_path.name}")
-            return None
-
-        async with aiofiles.open(info_path, encoding="utf-8") as f:
-            content = await f.read()
-
-        data = json.loads(content)
-        description = data.get("description")
-
-        if (
-            description is None
-            or not isinstance(description, str)
-            or not description.strip()
-        ):
-            return None
-
-        # Telegram Bot API caption limit for media is 1024 characters.
-        return description.strip()[:1024]
-
-    except Exception as e:
-        logger.warning(f"Could not extract video description: {e}")
-        return None
 
 
 async def cleanup_info_json(video_path: Path) -> None:
