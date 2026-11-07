@@ -249,11 +249,12 @@ async def handle_message(
             f"Video downloaded: {video_path.name} ({video_path.stat().st_size // 1024} KB)"
         )
 
-        # The caption is a mention of the user who triggered the download, so
-        # the author stays visible even after the original message is deleted.
-        # Falls back to no caption when the user has no public @username.
+        # Keep the source URL and, when available, the sender's mention visible
+        # even after the original message is deleted.
         username = message.from_user.username
-        caption = f"@{username}" if username is not None else None
+        caption = f"Источник: {video_url}"
+        if username is not None:
+            caption = f"@{username}\n{caption}"
 
         width, height = await get_video_dimensions(video_path=video_path)
         logger.debug(f"Video dimensions: {width}x{height}")
@@ -376,3 +377,4 @@ def _safe_stats_error(error_code: Optional[str]) -> str:
     if "geo" in lower or "region" in lower or "country" in lower:
         return "geo_restricted"
     return "other"
+
